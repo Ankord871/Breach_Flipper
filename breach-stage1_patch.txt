@@ -1,0 +1,2314 @@
+diff --git a/.gitignore b/.gitignore
+index ba53e71..99a0d0a 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -72,3 +72,6 @@ node_modules/
+ # cli_perf script output in case of errors
+ /block.bin
+ /return_block.bin
++
++# Breach generated output
++breach/sd_ready/
+diff --git a/applications/main/momentum_app/momentum_app.c b/applications/main/momentum_app/momentum_app.c
+index a81ae0f..d46e8eb 100644
+--- a/applications/main/momentum_app/momentum_app.c
++++ b/applications/main/momentum_app/momentum_app.c
+@@ -322,6 +322,9 @@ MomentumApp* momentum_app_alloc() {
+     view_dispatcher_add_view(
+         app->view_dispatcher, MomentumAppViewDialogEx, dialog_ex_get_view(app->dialog_ex));
+ 
++    app->preview_view = momentum_app_preview_view_alloc(app);
++    view_dispatcher_add_view(app->view_dispatcher, MomentumAppViewPreview, app->preview_view);
++
+     // Settings init
+ 
+     app->asset_pack_index = 0;
+@@ -450,6 +453,8 @@ void momentum_app_free(MomentumApp* app) {
+     popup_free(app->popup);
+     view_dispatcher_remove_view(app->view_dispatcher, MomentumAppViewDialogEx);
+     dialog_ex_free(app->dialog_ex);
++    view_dispatcher_remove_view(app->view_dispatcher, MomentumAppViewPreview);
++    momentum_app_preview_view_free(app->preview_view);
+ 
+     // View Dispatcher and Scene Manager
+     view_dispatcher_free(app->view_dispatcher);
+diff --git a/applications/main/momentum_app/momentum_app.h b/applications/main/momentum_app/momentum_app.h
+index 70e51d5..538df82 100644
+--- a/applications/main/momentum_app/momentum_app.h
++++ b/applications/main/momentum_app/momentum_app.h
+@@ -63,6 +63,7 @@ typedef struct {
+     NumberInput* number_input;
+     Popup* popup;
+     DialogEx* dialog_ex;
++    View* preview_view;
+ 
+     CharList_t asset_pack_names;
+     uint8_t asset_pack_index;
+@@ -107,8 +108,12 @@ typedef enum {
+     MomentumAppViewNumberInput,
+     MomentumAppViewPopup,
+     MomentumAppViewDialogEx,
++    MomentumAppViewPreview,
+ } MomentumAppView;
+ 
++View* momentum_app_preview_view_alloc(MomentumApp* app);
++void momentum_app_preview_view_free(View* view);
++
+ bool momentum_app_apply(MomentumApp* app);
+ 
+ void momentum_app_push_mainmenu_app(MomentumApp* app, FuriString* exe);
+diff --git a/applications/main/momentum_app/scenes/momentum_app_scene_config.h b/applications/main/momentum_app/scenes/momentum_app_scene_config.h
+index 80ba33d..137e78a 100644
+--- a/applications/main/momentum_app/scenes/momentum_app_scene_config.h
++++ b/applications/main/momentum_app/scenes/momentum_app_scene_config.h
+@@ -6,6 +6,7 @@ ADD_SCENE(momentum_app, interface_mainmenu, InterfaceMainmenu)
+ ADD_SCENE(momentum_app, interface_mainmenu_add, InterfaceMainmenuAdd)
+ ADD_SCENE(momentum_app, interface_mainmenu_add_main, InterfaceMainmenuAddMain)
+ ADD_SCENE(momentum_app, interface_mainmenu_reset, InterfaceMainmenuReset)
++ADD_SCENE(momentum_app, interface_mainmenu_preview, InterfaceMainmenuPreview)
+ ADD_SCENE(momentum_app, interface_mainmenu_style, InterfaceMainmenuStyle)
+ ADD_SCENE(momentum_app, interface_lockscreen, InterfaceLockscreen)
+ ADD_SCENE(momentum_app, interface_statusbar, InterfaceStatusbar)
+diff --git a/applications/main/momentum_app/scenes/momentum_app_scene_interface_mainmenu.c b/applications/main/momentum_app/scenes/momentum_app_scene_interface_mainmenu.c
+index fce1f59..2ed3377 100644
+--- a/applications/main/momentum_app/scenes/momentum_app_scene_interface_mainmenu.c
++++ b/applications/main/momentum_app/scenes/momentum_app_scene_interface_mainmenu.c
+@@ -3,6 +3,7 @@
+ enum VarItemListIndex {
+     VarItemListIndexMenuStyle,
+     VarItemListIndexResetMenu,
++    VarItemListIndexPreview,
+     VarItemListIndexItem,
+     VarItemListIndexAddItem,
+     VarItemListIndexMoveItem,
+@@ -82,6 +83,9 @@ void momentum_app_scene_interface_mainmenu_on_enter(void* context) {
+ 
+     variable_item_list_add(var_item_list, "Reset Menu", 0, NULL, app);
+ 
++    item = variable_item_list_add(var_item_list, "Preview Layout", 0, NULL, app);
++    variable_item_set_current_value_text(item, ">");
++
+     size_t count = CharList_size(app->mainmenu_app_labels);
+     item = variable_item_list_add(
+         var_item_list, "Item", count, momentum_app_scene_interface_mainmenu_app_changed, app);
+@@ -133,6 +137,9 @@ bool momentum_app_scene_interface_mainmenu_on_event(void* context, SceneManagerE
+         case VarItemListIndexResetMenu:
+             scene_manager_next_scene(app->scene_manager, MomentumAppSceneInterfaceMainmenuReset);
+             break;
++        case VarItemListIndexPreview:
++            scene_manager_next_scene(app->scene_manager, MomentumAppSceneInterfaceMainmenuPreview);
++            break;
+         case VarItemListIndexRemoveItem:
+             if(!CharList_size(app->mainmenu_app_labels)) break;
+             if(!CharList_size(app->mainmenu_app_exes)) break;
+diff --git a/applications/main/momentum_app/scenes/momentum_app_scene_interface_mainmenu_preview.c b/applications/main/momentum_app/scenes/momentum_app_scene_interface_mainmenu_preview.c
+new file mode 100644
+index 0000000..d4f38bc
+--- /dev/null
++++ b/applications/main/momentum_app/scenes/momentum_app_scene_interface_mainmenu_preview.c
+@@ -0,0 +1,272 @@
++// Breach: live preview of the main menu layout.
++// Shows where every app will sit for the currently selected Menu Style.
++// Up/Left = previous app, Down/Right = next app, Back = return.
++// The highlighted slot is the same app that is selected as "Item" in the Mainmenu settings.
++#include "../momentum_app.h"
++#include <gui/elements.h>
++
++extern const char* const menu_style_names[MenuStyleCount];
++
++typedef struct {
++    MomentumApp* app;
++} MomentumAppPreviewModel;
++
++#define PREVIEW_TOP 8 // first 8 px are used by the caption
++
++static const char* preview_label(MomentumApp* app, size_t i) {
++    return *CharList_get(app->mainmenu_app_labels, i);
++}
++
++// One line cell: "N name"
++static void preview_row_cell(
++    Canvas* canvas,
++    MomentumApp* app,
++    size_t i,
++    int32_t x,
++    int32_t y,
++    size_t w,
++    size_t h,
++    Font font,
++    bool selected) {
++    FuriString* str = furi_string_alloc_printf("%u %s", (unsigned)(i + 1), preview_label(app, i));
++    canvas_set_font(canvas, font);
++    elements_string_fit_width(canvas, str, w - 3);
++    if(selected) {
++        canvas_draw_box(canvas, x, y, w, h);
++        canvas_set_color(canvas, ColorWhite);
++    } else {
++        canvas_draw_frame(canvas, x, y, w, h);
++    }
++    canvas_draw_str(canvas, x + 2, y + (h + 5) / 2, furi_string_get_cstr(str));
++    canvas_set_color(canvas, ColorBlack);
++    furi_string_free(str);
++}
++
++// Box cell: big number on top, name below
++static void preview_box_cell(
++    Canvas* canvas,
++    MomentumApp* app,
++    size_t i,
++    int32_t x,
++    int32_t y,
++    size_t w,
++    size_t h,
++    bool selected) {
++    FuriString* str = furi_string_alloc_set(preview_label(app, i));
++    canvas_set_font(canvas, FontSecondary);
++    elements_string_fit_width(canvas, str, w - 2);
++    if(selected) {
++        canvas_draw_box(canvas, x, y, w, h);
++        canvas_set_color(canvas, ColorWhite);
++    } else {
++        canvas_draw_frame(canvas, x, y, w, h);
++    }
++    char num[8];
++    snprintf(num, sizeof(num), "%u", (unsigned)(i + 1));
++    canvas_set_font(canvas, FontPrimary);
++    canvas_draw_str_aligned(canvas, x + w / 2, y + 3, AlignCenter, AlignTop, num);
++    canvas_set_font(canvas, FontSecondary);
++    canvas_draw_str_aligned(
++        canvas, x + w / 2, y + h - 2, AlignCenter, AlignBottom, furi_string_get_cstr(str));
++    canvas_set_color(canvas, ColorBlack);
++    furi_string_free(str);
++}
++
++// Small numbered square for carousel styles
++static void preview_square(
++    Canvas* canvas,
++    size_t i,
++    int32_t x,
++    int32_t y,
++    size_t size,
++    bool selected) {
++    char num[8];
++    snprintf(num, sizeof(num), "%u", (unsigned)(i + 1));
++    if(selected) {
++        canvas_draw_box(canvas, x, y, size, size);
++        canvas_set_color(canvas, ColorWhite);
++    } else {
++        canvas_draw_frame(canvas, x, y, size, size);
++    }
++    canvas_set_font(canvas, FontPrimary);
++    canvas_draw_str_aligned(canvas, x + size / 2, y + size / 2 + 1, AlignCenter, AlignCenter, num);
++    canvas_set_color(canvas, ColorBlack);
++}
++
++// Grid that is filled column by column (like Wii, C64, Compact, Vertical)
++static void preview_grid(
++    Canvas* canvas,
++    MomentumApp* app,
++    size_t index,
++    size_t count,
++    size_t cols,
++    size_t rows,
++    int32_t x0,
++    size_t cell_w,
++    size_t cell_h,
++    Font font,
++    bool boxes) {
++    size_t page_size = cols * rows;
++    size_t page_start = (index / page_size) * page_size;
++    for(size_t s = 0; s < page_size; s++) {
++        size_t i = page_start + s;
++        if(i >= count) break;
++        size_t col = s / rows;
++        size_t row = s % rows;
++        int32_t x = x0 + col * cell_w + (boxes ? col * 3 : 0);
++        int32_t y = PREVIEW_TOP + row * cell_h + (boxes ? row : 0);
++        if(boxes) {
++            preview_box_cell(canvas, app, i, x, y, cell_w, cell_h, i == index);
++        } else {
++            preview_row_cell(canvas, app, i, x, y, cell_w, cell_h, font, i == index);
++        }
++    }
++}
++
++static void preview_draw_callback(Canvas* canvas, void* _model) {
++    MomentumAppPreviewModel* model = _model;
++    MomentumApp* app = model->app;
++    size_t count = CharList_size(app->mainmenu_app_labels);
++    MenuStyle style = momentum_settings.menu_style;
++
++    canvas_clear(canvas);
++    canvas_set_color(canvas, ColorBlack);
++
++    // Caption
++    char caption[40];
++    if(count) {
++        snprintf(
++            caption,
++            sizeof(caption),
++            "%s  %u/%u",
++            menu_style_names[style],
++            (unsigned)(app->mainmenu_app_index + 1),
++            (unsigned)count);
++    } else {
++        snprintf(caption, sizeof(caption), "%s", menu_style_names[style]);
++    }
++    canvas_set_font(canvas, FontBatteryPercent);
++    canvas_draw_str(canvas, 1, 6, caption);
++    canvas_draw_str_aligned(canvas, 127, 0, AlignRight, AlignTop, "< >");
++
++    if(!count) {
++        canvas_set_font(canvas, FontSecondary);
++        canvas_draw_str_aligned(canvas, 64, 36, AlignCenter, AlignCenter, "No menu items");
++        return;
++    }
++
++    size_t index = CLAMP(app->mainmenu_app_index, count - 1, 0U);
++
++    switch(style) {
++    case MenuStyleWii:
++        // 3 columns x 2 rows, filled top to bottom, then next column
++        preview_grid(canvas, app, index, count, 3, 2, 1, 40, 26, FontSecondary, true);
++        break;
++    case MenuStyleC64:
++        // 2 columns x 5 rows
++        preview_grid(canvas, app, index, count, 2, 5, 0, 64, 11, FontSecondary, false);
++        break;
++    case MenuStyleCompact:
++        // 2 columns x 8 rows
++        preview_grid(canvas, app, index, count, 2, 8, 0, 64, 7, FontBatteryPercent, false);
++        break;
++    case MenuStyleVertical:
++        // Flipper is held upright: one column, 8 rows
++        preview_grid(canvas, app, index, count, 1, 8, 32, 64, 7, FontBatteryPercent, false);
++        break;
++    case MenuStyleDsi:
++    case MenuStyleCoverFlow:
++    case MenuStylePs4: {
++        // Horizontal row, selected app is highlighted
++        int8_t first = (style == MenuStylePs4) ? -1 : -2;
++        int8_t last = (style == MenuStylePs4) ? 4 : 2;
++        int32_t n = last - first + 1;
++        int32_t x0 = 64 - (n * 21) / 2;
++        int32_t k = 0;
++        for(int8_t o = first; o <= last; o++, k++) {
++            int32_t pos = (int32_t)index + o;
++            if(style == MenuStylePs4) {
++                if(pos < 0 || pos >= (int32_t)count) continue;
++            } else {
++                pos = ((pos % (int32_t)count) + (int32_t)count) % (int32_t)count;
++            }
++            preview_square(canvas, pos, x0 + k * 21, 20, 20, o == 0);
++        }
++        canvas_set_font(canvas, FontPrimary);
++        canvas_draw_str_aligned(
++            canvas, 64, 58, AlignCenter, AlignBottom, preview_label(app, index));
++        break;
++    }
++    case MenuStyleList:
++    case MenuStyleMNTM:
++    default: {
++        // Vertical list, 3 visible, selected in the middle
++        for(int8_t o = -1; o <= 1; o++) {
++            size_t pos = (index + count + o) % count;
++            preview_row_cell(
++                canvas, app, pos, 2, 12 + (o + 1) * 17, 124, 15, FontSecondary, o == 0);
++        }
++        break;
++    }
++    }
++}
++
++static bool preview_input_callback(InputEvent* event, void* context) {
++    MomentumApp* app = context;
++    if(event->type != InputTypeShort && event->type != InputTypeRepeat) return false;
++
++    size_t count = CharList_size(app->mainmenu_app_labels);
++    if(!count) return false;
++    size_t index = CLAMP(app->mainmenu_app_index, count - 1, 0U);
++
++    switch(event->key) {
++    case InputKeyLeft:
++    case InputKeyUp:
++        index = (index + count - 1) % count;
++        break;
++    case InputKeyRight:
++    case InputKeyDown:
++        index = (index + 1) % count;
++        break;
++    default:
++        return false;
++    }
++    app->mainmenu_app_index = index;
++
++    with_view_model(
++        app->preview_view, MomentumAppPreviewModel * model, { UNUSED(model); }, true);
++    return true;
++}
++
++View* momentum_app_preview_view_alloc(MomentumApp* app) {
++    View* view = view_alloc();
++    view_allocate_model(view, ViewModelTypeLocking, sizeof(MomentumAppPreviewModel));
++    view_set_context(view, app);
++    view_set_draw_callback(view, preview_draw_callback);
++    view_set_input_callback(view, preview_input_callback);
++    with_view_model(
++        view, MomentumAppPreviewModel * model, { model->app = app; }, false);
++    return view;
++}
++
++void momentum_app_preview_view_free(View* view) {
++    view_free_model(view);
++    view_free(view);
++}
++
++void momentum_app_scene_interface_mainmenu_preview_on_enter(void* context) {
++    MomentumApp* app = context;
++    view_dispatcher_switch_to_view(app->view_dispatcher, MomentumAppViewPreview);
++}
++
++bool momentum_app_scene_interface_mainmenu_preview_on_event(
++    void* context,
++    SceneManagerEvent event) {
++    UNUSED(context);
++    UNUSED(event);
++    return false; // Back is handled by the scene manager
++}
++
++void momentum_app_scene_interface_mainmenu_preview_on_exit(void* context) {
++    UNUSED(context);
++}
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_0.png b/assets/packs/Breach/Anims/Teto_128x64/frame_0.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..855f7deef9230e41771a6126d5eed863684e10de
+GIT binary patch
+literal 785
+zcmV+s1Md8ZP)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008mNkl<Zc${66
+zPiS0K6vlt|&T}S1|2<QYiKM(ikx~&v1SwK^uaZSTSGtzY(v_$csf(I7rKJI@sa?6M
+zUAhqIQc*ImB-pyq*i{kDyr`J|3G`(go0sOj`?+{CS$H-F4(IpXbMHMLs-io}qDn<D
+zE?594I*g;L|E>RZG&W6yjM?q@alYPAf(yr@H^2xKj1gmVo$l1OcahjQ^MVTcBg8=%
+z0|)ve#C1p`Fl%5(bLH8ZuW}(B6}DG+|8T0~@mTav^5-8grw6@}h6jridllPwgsfvO
+zGD&i~5|x*jo!ESx|N3NAI8%OLfybKty<nm2Ibs*H_9gE|AZ;pd9vsZ+T3GB0W#N}-
+zo?$Z~NNaaekfx9E#(Mdj(#PGYKo;GbIo89b_)Rkl$Wa@fTX*M`1A#1#>52C+(=dSn
+ziwTl)9wsSr_JKuDkl|CO9`R`#i=9pUcms=F(sCslWV)xtSBtK)P!>b`5Biv)>-mhH
+z@G_6Wahv-4!Gndjuj5#K?M%8<edWR`?oFNFs$awpgw)TBJJjnB>a8FRgcQ>}eJJb?
+zANi^poh~_ojq;fku;?5yw0TOCL3Qj)`(s>opU{sSSeUvCUa{C{&)gV*#eCvnu6f1L
+z_~wTfB9I!+d~~Amaj*<?eOZWHf`7?NO>p5-2Mb3{1Se<dk?$l}h?fpJ^Kb@B@pN_D
+zWD3e>xdW@<0fyUc?;FKgyV?w1IlFbYg}Fs*vO->DcDn=e^M18b|GXSECH-*!yY9#@
+zZ~fGew5-LQksA(wR-pKMe$Ohz1wmJtj_CSU)p3(6d+6&HQ?2ThtF&K_d@NVqsgTPj
+zHbO~z6zdClz#zFAfeNB<tz#i;q#a-Yzqwrl?MQ#s^z*4e7BXV~g}j6uJTPX9;evmJ
+ziEk?-KP;s*j57`>4P-$lftA_{J}FqJ`6aE*vk7eyKyr;a6`$82bOibjA|17xDqdmU
+P00000NkvXXu0mjfVdHh2
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_1.png b/assets/packs/Breach/Anims/Teto_128x64/frame_1.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..33ef97becea2cdd898a656c035ec0e1ad14fdcdf
+GIT binary patch
+literal 781
+zcmV+o1M>WdP)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008iNkl<Zc${^U
+zPiP!v7{-6|?Vp*_-Aq~$6*iqgdJzl-5iKI_nC2j!il+$D^dxvn6onSGJGB)(1Pvm1
+zvq4nwAVxgsLCi)M6$+XtNU)8WP+^N0GD)|a&1Pnv9(Ffi!0-6ud7k$V?`MhsKEwZj
+z`~i?YJ^)rP<5u~AV((zaU%M7?F%L+RbgePuDfW`8`swL-=Qgu`E*e<2UX9Z<igx!c
+zi&m05znHP6zM`sA99uMY)K_G1Pb0wUEc6vw6m}-hdRcMMM><#Qd=f`aHW;c44_4+k
+zJDow5Cf#e@yws`oGn$S*F5C+@_h;Ev$aJ{$Q4cIykBlX7k_TqMfF?yX3mK{NVt|3|
+zC@m}l5%y3W1Iy1fcpnhF5MkhIBY29#b^H~^0A*HGdZwAWiYs2-6Uw0VRZ~|KTPdCl
+z87?iD#!=1!l)BACO?|Cak&-8a)+aVX*rWIuM}17M`4V=RtGh3Ofm!S@Cik!|{c{?S
+z&~Lh`g<AK?$;=xp*@fd~ZQk<9gR5;USS9)$KzjE^K701NiyOr-_nxOb4Bt0G<J0vb
+zE0r^4kS=p59jUG*b_qNoSy-=EPOP;GZSZ8!n*csD>2`vTfhTN8Cb*>GQ(1(8yI+B0
+zzL*^UxeG|o|7&UJ>6wQjuYRE_1D_p5%U!KH>j85Zn9l;Hf62#xdLLS6F%Vb*z72-^
+z-wH6m-fULB<?uZm4l%&Z3a#$jIMcLy=TIMg8GBRii6vV?(hr{}?|90lrdEb)LQ*=4
+zTa%ho*Xe<+(UUnzKh;)$lnhWlGhPCY(>>Qa80$-bQ0#ostFrT2_NY3VP;<9uDHz7s
+z<Xesm&4Hw#mL$58q1f|eApU^cxgfBBk^S$X1*xFe@r3lNtGx}WZD|Kj2DT3Q`9Giy
+z$s8DP{{{zQQ3$}mk#e0jT*tu&19xrvz#HG-*mW?FErH-P!vJ>x7G!!_{m1Pa00000
+LNkvXXu0mjfvMpuO
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_10.png b/assets/packs/Breach/Anims/Teto_128x64/frame_10.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..32aed9a643479b367c6269207e50c87310ced389
+GIT binary patch
+literal 809
+zcmV+^1J?YBP)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008;Nkl<Zc$__x
+z&ubiI7{@>F?2y^Onw^ShK*^3)P<v@DEmjHcDuT5q!9x)OjRzqI55)==iQTCc^dR)&
+zK?<e8e?TD$MO(8eB8z$`Mv!V`XYG%)y4y_igWb)}yk8G9+uO^B=leWgp7;A8NmA!m
+zDoUtJWT5Hus!ppQIRM~qMn}@ihqps=@ZI?2-@S8NKrR_K_R*)LXepPdr}~LEjd{G0
+zODueO?FLMdgLFBG_bf@x5!ks}`2FY)r=7`B(>1fXXvZa6&yD?LHr6#Q^+(2<`+Gh!
+z-|+9K$ElhRaf5{n$oRD(ywGWXnt^|8X@3zK0q<s0&aOW5_D)?__9~TJQ2cpx$ps7X
+zgE%k@{nyafL~eQp9O$lpW^iI^oq`|Y!mTIw0Wp5tI4Lgt^6jOs;0yZT0@9)KZS}OM
+z1g0bhHQzC;QiQPZCm`$TPJKn^)%Ub4Ik1h-1TSHdyvH#O)K%-Pt&ggygtS!IR97vN
+z)T-MOQrP-UT@_k(x2{P@%Qn)KytNPEgoLy%R}<A<JVEti32ALU&{Xx0sC<~B<Ur|_
+zJA^^7zzjQp6bIPz)&B}(_aawvA+AN(lQ%W&RR-Wde7#||Ryk0A=-F(^<pFRo*tPJ)
+z$_yZNT4?Xj$E(G_%dEF;kUrObKo6fR4<rYCUWdOH>rb=qE;ul@%Qu4~OQ+_!atItS
+z-H@xMmKGe%0+OY);g+S#JCn-d;1)Ob_yBVOASLmSH#|wte;<`42MQ~5%mXjiR{iYv
+z)2+ZrdSfW%;U8RRsBd?t=~4#b_gn4Cb?ey|t9ivIy`jz~M=iM|@`jsgCFR7^{d+k;
+zkYq0hcq~kAgT?tEzn9q4F{$I(wkmRfxJ0W@DdC**@E4R+bkV4gWEJ<OVXoQG!S|B;
+zH`nJ(jHkFV8ar0DF_Xku?%EeZb8%Wglu4qhlz328Ba=Kb3&{{_s%1`x$5Gz`8@Y8a
+n!h{B&m;fa8%hId?g;exE_vh?Qs%Nf|00000NkvXXu0mjf%4m)F
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_11.png b/assets/packs/Breach/Anims/Teto_128x64/frame_11.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..69e3b364c9fc83e02695dd92abe9127006d8e814
+GIT binary patch
+literal 814
+zcmV+}1JV46P)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008@Nkl<Zc$_`c
+zPiP!v7{~GN`|czgsL5;yO2m-em=cQgkY1Wp+sqV2MFbDtP4LpAJ$Mm>osvQ?l~^b!
+z9{hvSllM{(cbW*TRWKr=Ld{M{w5?6M6E{sJ+1dB!VYc30K0LqYIlRw<BuVY}P4SQg
+zfcC40YRH7(6<|-64znDb28zOar<30`E*Gc=-<NMsy?5_gR(%YFox!V8I^P2a!G#b^
+zvp2;htd1?fTL}eplg94xwse^u9IPJMdS=adPdpyG;qCv?@gy~RJvRHeVn?AH_afzK
+zMJ9UJ?euz>@Ock&bj$u+z`FY9ZN$^b{!0Y}EdY{~S+LMuxb@^Y6GNrE3?A%-Cb{Kc
+zGGPxq_{Bf|1~wu8S1*^a@awa)LJ^fA^A%XQJRDD8QU=yd4J;ZSB7`Xzz=T+cw|G6F
+zk36FvECgPT*ogW=9)X1;Y)2C)EUoA}u$WQcfR)b`-8=?JjcQvD)cnGQRn=wTdfWg=
+zq67g_>|%YOa}T>lPD1)gp2po$doHSsNl2~iu*QQ{>Q{oKE)RAt{RL!$Ovh6vu<&P`
+zDXOJE?tU2^gjgVI&`D}9x~I+>u#nyeBbV(n*YF(}(friYhv!edcIDeo?g|T?kqDf5
+zuzKl!21qMzLhmf6^^28~tII--&<#vH$Kp|s2n&aXt0ta06Zwq307&i3bJP6~-P+00
+z4GAe{@PM+qYp1A69>BssLk1g1KNKIO^^w#}LzUS&c;Nm0@%=1@Y@l|tSgG#*=8B{f
+z-P>gqdwQ2iNpE)5Dqv^(qga`n%-wvi;=*s6)eTox@L2(Ad9SUdd`1KX#ILAbZ)Qum
+zQ33nq&KYUj&&xeXXRi89C4P5N%_1_Q`IfSB_qvJ$+MCpzv|DnWynwW%+}GE}&16-1
+zfd37=eg2WAHnRV(G8<b=@$V#6S>Rd}_up|Tl~IaA9*7A$eFBmq(rQR~83IMcl%1-S
+sS*Yg}J#-c_2kcNpa$hbnR1_2FKMK$ED9U{%aR2}S07*qoM6N<$f|1XH!~g&Q
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_12.png b/assets/packs/Breach/Anims/Teto_128x64/frame_12.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..c871beda784410909bcfef8fe7cc8516f39ef817
+GIT binary patch
+literal 820
+zcmV-41Izr0P)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008}Nkl<Zc$__x
+zL1-Lx7{!18|4g%+wse;?w5u`BHicF^L=l7rj5DktN)HA^?8!tu^j30G5Xp{4s0XFF
+zcu{B;ZytoImw@6<3?d?G4h4&c?8K%vSS3>vo7rS`o`>1yJN|gz<H7emBuUB^)gKE0
+zin%`pzn9=ku`l((-yaNAl)wSlG|?BjtlX1ZEUue#Z~WB59C(D`+VKe~@nr;n2__Fu
+z1faempJC+n7F4GD9{J3|$?<KGZBT$-wDtQD7vs;&6iN4(x;9irQN8bRyWHK9E8X+^
+z!G3)pRerUprM4^}<5ykGc+4YUf$y?`M{P*0-W>y^+}|DkGH>ecW2xuM!d`S}_>_rQ
+zr4$EPxWmRed4iX)7h&Nue=NXO8A|ym#=<9`J~)Ujke7K4T=deZ{ogPt<v-euX)L_=
+zG}qw-s6l{*QbYj9aKWi#VV7PFHpv4<LM$vp2qtn?^b1%_)Jix(qouHSGz6(S{jdH}
+z$Ik<QzbzML75#h(8pLwILS=3!NZ`C#Zz;lsslDLq;MKv|E6r8~kUFVpj&?fRXKP;O
+z%fiia88fwN;%n=NVk~?crcezMMiE$;Ct@z*>i%#-3k$DY38XN6$8T4D01M~ugl6Z@
+zURlqMJ_$%)`KI~8+1A*qZ!%vlTyLMw>rXhno#ka4Vu38MJQKt#4>e4Pg$w`HRkjVv
+zr$-ck^nE(`)~w^m^PH|^Vf=kquzL#Xy<>p1AN}~YTT*YW^PDGHaGm<>;Tjfd_2T-2
+z)urwXpoMbrr#HK|K9uy$TITd$I}J*bKF{}83ea0WIWILQ^0_zric&jLqT_mMt0>Uj
+z^5bXf9i_Y&7p74~yXs^w3%^j<IyZuPc1}*zS6sa4wUt!lXi-Q?Zp)K4N_i|#78nTh
+zFw`>haj)N~j<QAFFq%xg`z7pFI!nwQNe)07&nJ|&V^0?Jd<c_yLhUGE!7LFD{Pk`O
+y^pjrprK|+L!op*-Eu|Kk8AXmt3~3JR0RIC{V%>K2a7!5g0000<MNUMnLSTa935H4l
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_13.png b/assets/packs/Breach/Anims/Teto_128x64/frame_13.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..7ec94a16b0cd1a3d30ed983a2cefc332a54b9586
+GIT binary patch
+literal 815
+zcmV+~1JL}5P)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008^Nkl<Zc${66
+zPiS0K7{!10&TD64VrOcl3DWWcA}HdYg=j!@o-V9{LJ&n4$_%dD8C|%L)=Vf3ffkyI
+zP#2ZNl{+=KFeqkTB?|*mgW%5Qz0lB1F_1T7n$Aq#+~eZSRPft;a5(3?-@W%7l+{eX
+zi>#&o0I&eysthW_xAZ^8p{5Ctv3D737Y^qY%asR18zyYZpS~6ifVIQzS5LQc?aBbC
+zy|6L*tQ?Vy05F_6+Nx2UT+A4075~&Yrnk_Sw8M7s(lJTp{vMt6{2y;!w`j1(KWNDr
+z$<_Oey+Zf--Y|3_1GbMc?|oLIodLZ<__k_19_tu*z`4%siU;@OM!-UE#U-JwvALd0
+zLM+@~aSv?*?BPN@_;cx%;3E_A;2yVPEWD9_>6RrS_4GPe^yZ6C15=bdGZ%ndl1snd
+z)`HqVB#SGZ1}H%R8-mjEcIVEveozWUUl#LYgSinrY+!cBLGI#iM>q7ddO0oEWg(gD
+zP{73cv=M;C%*2}{m_=KEIG^3N`YwPaE@gjP*Q&0o{+rN2Sso<Ob1rzVFf~6v^l=PQ
+zlnhOuRMaY7@xuin)fhT+@`=h`eg}LZ8H`Spqb<81QW0{qW=1EX$mSZ(L_+SDBWC)6
+z`bI8D%c{u2<s0B#I5IkZ_V+^}7IW`wD9BwYyg&DSHvp;VK6I7i=l#_}PLV83>`ziU
+z=f&pod8$}g9u8BQFSEw&UWf&npV!PMPhsdili4A8EFI6C(g%JmpLu=r%hW5%?N+`j
+zW==l-WO7dl6EoV%9_aAiJDn<M-Wyoz@2hK)Hg<oS>F1?!EiY+9-yUQ$x;HPSsP+xX
+zd?s<ee^!Ye(e9l-gT)~tHE51yr~FEAUr?gO;#4MC^>@mWdsJ7oAP*SPcLDGh#qws=
+z0{NvXHM+3l?q;qlZRHeA_?g#Z_F=3?V*-#8q-6TyGWjs}Wns7nN!Xg8PzEg617MwX
+tO2puS3TbYvIjjG&pPyFxg@v-i*T4Hr@u*kT)y@C_002ovPDHLkV1mV}i-iCH
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_14.png b/assets/packs/Breach/Anims/Teto_128x64/frame_14.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..74af4c187833edba6307d8f576659cc145a8885c
+GIT binary patch
+literal 782
+zcmV+p1M&QcP)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008jNkl<Zc${^U
+z!D}347{-6!x0B4Mb+Z);6%uwu(Swy1E7XH^M^W)+@#4*HpddoQ_9&*wgalVn48?;U
+zf_oBslKL0yM2aaW(o(Q36n9b$+d^q4?V8Na&d%dub`=A@#~%;R`@;J?M*Mdy{{x&|
+zU^q7hrto<1=q|-zw@2Q$z@q&J#J@aJW2-&zL6W3v@Q0dewlq>~twnv^Pfv$q#bRmo
+z$cIwU(g+ZIRQ@W%ZI3_>FE@QS(;j)`8^PrR4QZB<M?a9cenm_9SdpUm$uF2=tmry}
+z>!~B%8k_$5cwfV5X{$aytRn2GfU^Neig4cUNf(Z1Q*~KTU6ofJ4w#8J<zpee*4h_k
+z5dB%24?$WV#P4@iS9n<4Rav;YT)CYC(H(vQi!RUZ0pJ)HpYlO@LiXLJT1repN0!{H
+z1DphT7EtEyB;8GYt6nLbsLEpgO3c@meM}zpPuH-RFChR0r5~qW1qb3whbJ>8=5+RC
+z-^F6q8ioY3Y`;I|Mpy_No#Ka`P&FKAAH4;@Vx%+(9iUVj%s;(+r(-G$5lF4%p@kW>
+z9vob)#w}Uc^ngRYi4JX40+0+w)Adfz-G;g>`j{Z6#^(c@m=Ftf7n?O$a-C=L8Wyf>
+zf0E~wA@3}84WRtJZ_L8GZ>>HbRo8L}shU19|N9%CO@*M2klNX7e*Cc&t+!UxmIdF`
+zvPu(jUR)_6m6>#Y&sD9rLL*tAcfj6H-{eBfWD$qxxr|a*&wg;JDLFu?L3!_f`FNiu
+zfd!^B&onS6n2d{_B()cQ4j}h*a|R1|H($R2STCI}!oU5)!g-)d(k-^^%;iUv=!Clc
+z;tpej*SN=d_Ld_oaM9#vIHw-TejlWJJBn48Q2bJL+y+USQ0!G@A*zJgT~HY}0Sg;j
+z4d*ww8<PcK;b2zuaL9xY7Sdrz4ma>9K-t!CSU!j6hW~aS8dL!O24EwhUe)EW{r~^~
+M07*qoM6N<$f*lHK-v9sr
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_15.png b/assets/packs/Breach/Anims/Teto_128x64/frame_15.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..66d3aa7ecf8585083e030efbba4067efed40f367
+GIT binary patch
+literal 815
+zcmV+~1JL}5P)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008^Nkl<Zc${6+
+zPiP!v7{~GN`|cz=k+hj;krJxA(jHWh1Ow{9Fe_9PEHnoXdTI|sJqQ-Os0h0u^-%Fp
+zPhNyXt<;N9Xbx2pchX23u<F4-6b#KotchtLn{3R^W@p}?hw0|f_wvGr=lSvSzRzm}
+zK&OX$%jVl%?t|U?A;kwK>^{URPgGc`cWPZ&8u|TYhNJ2Iig0xH$?T1_7Xe9<t{q5D
+zyi<3Ds=5_B*PAnA_DHuy(%dhvd*)UbTvYq=+qmEsyO7PtTk8wyg|Hji{A76{S&@>e
+za#%H;(cM1ja#bDxt0XtmQFySM5k1|DJsokP3kS<!H!AHQ4~^-+vLpR<D&3PTD0Gj^
+z_z}}yA+3Sb)@Lu=aaBb}bu*NOpE*7l5##miB3Sq%IyQlcSvoKn)Ijd-#*s^3Wy5L=
+zBqo%F^MkRob`5{aFM!4Q2eWJNDtufU0+bdz|88E=vq~WeWikJq3j)U^8KpKLH>GW@
+zYEJD*HN*T)V>U2R!O;&E^LfSK%Y0$$<+Oqak?sJLC!(+uffTyG^{1}<BuXDl38~&X
+zUmbE&t&@jK^P!OHNuL|5*LPl7^a*9*hQEi-#v9)qPMF5R`vis&;w(5@1mq@}$j0i+
+z*31mJl90PzG}(x5_g1Rrt&)&?Ei>7ppDsNU_s(a_LOPQgcl+c}aS@}sEPQQ&e?ENI
+zmFAieNH3*Zd#4_n(v7KwRI>0~c7dR`0c1t6Q0u8#bN4boH1P7b-41Bj7|M^mR{=?l
+zrw(}on>sU`kWb;S)vFJT1geei8t{PU*E{VBhD0vUXb$yzHNbaAbLelF-vE!oy$O=<
+z2ehfuGnqr;Y{EL<)Aw)=zPA|gjc$P-V}axL*dF5s*v=1DX>ZPk5=tq_LK4)1A0uS3
+zZ{``rUQUB^;P3yamXsppE$l=9vph~2EUX-=aFKIYS)&3L1{$z|8z*2IkXp@_HdU-q
+t5+xxuOiM~EgpQIt@bTIF$U$Wf_#Y7TmnpqJ8H4};002ovPDHLkV1g~Wf&l;k
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_16.png b/assets/packs/Breach/Anims/Teto_128x64/frame_16.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..9bbebd68b8a7305a8b3e49aee01d451e84a5f6b3
+GIT binary patch
+literal 801
+zcmV++1K#|JP)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008$Nkl<Zc$__x
+zO=ui-9EP9y&vbWI+H^HNtRG~zwuoM20}8Q+%(C`S@Q@xncxw(Gte1iW+hS!0TQDd{
+zL_rTFZ9%Mu9&!_ecGnc!N}&lgXoc2HXz5ag?BuK2*^hZW%uasChxhlK-WN%d{!)4d
+z00Pn*fVNzSEVBa|^T#WEsh@%5^F%54dCya@;}~t8`giL><&~Ypk1vMzTM9>{0WkKN
+zabPnAJ?M`36tAYB?K6I3Lh7f|u3cGq@U_ckDt-8}&i-vnD{124{^p|tL+~g~+!<~z
+zcTU%|CzYN*a90{t_+|<U%?-sf^|h@8#QtlSpGb$L<B4?sO1Y7T>QPRB0o4|x_igB)
+zX&<CW;UBkqQpMZ&OhUS;#^u|cV+y>UkqrEK^+=3Uf&~XK=<dPMdB<uHu5$=b+_R&1
+z7BrzJL$oDB?7S47g95`J?fno?&)!~BQy**Hif%{-tLs{TeJY!IJO&0`!Xm())+dvI
+z!9Yx&>xZ3dtooq%XsxMl;<}0P#ylCUIj-@lHT6KHr7r-f9<S66^^1>>m1F8Mz}inW
+z%UtX<W{d>}O1ab6K5ked0|qX+dE$Wc+XZjS2g%|&y`|aA@Kclbgk*EJUtYeSY1FQF
+z>O!h!t^VuZ-J5D)t0tsR`^5iDys&q1B>PlC%Kkz;`^Kz(yWmBV0k>-ReqCO}Q2h!F
+ze9tQROo=-3!9bxu<Lud(W*61S$AL;z>uz@L;VkYSH2K!Eg>Q2q0b_R3k6?IdsHnJg
+zvNb5b?d-EAvD&U&9|w4T&OS2*klVH}fJ(i0lZJN(Ysdo;9@aAnXge1}{!^Z;odDPQ
+zpv@JQpyPw2NDFUkS-DzFQ3g1&S^nKG(Z<@Byl6M3fq)+pQ1-DJtOB<ZunXRU-Ga%T
+ziJg?@$SNqNBOK#g8Fw(`l`@neAWr~Dt(z?=&VnbuC<CSkcRF1_J~*K9n1k&YD(i_O
+fBd|h%kP`m`=`h3NUC&^I00000NkvXXu0mjfuPKB|
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_17.png b/assets/packs/Breach/Anims/Teto_128x64/frame_17.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..ad359a12286e2f4f46843eaca2aaa152389110e6
+GIT binary patch
+literal 793
+zcmV+!1LpjRP)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008uNkl<Zc$_to
+zPiP!<9K}EL+u6*}hVC4yi5GWUa;Ue8Qd%~eDGC)TMsFUpMrfh8co8j>?hvb|Ah{W|
+zl0CL~FnF+t+N^(|LZKVzCE%Y-u$VSRGEJ6dCYk*`53_T9zxUqn@qG_TlD?KCr7ej9
+zn3SXhPci@y{N$jzHlSeGzZy@~Q|<mzN^BUJ+v}s3Ymy6qbMUjJ?R0%jr9{ULrEfvy
+z_tLa~Zs+kDG}|R31<fvKcfVw0Glb1&0zWAk>s5J+RoOe`w|CF%-cFyB4wjNzos~3S
+zqJJC;AZUz+L(}|v5{h8g!kkJca<2|d?WyjL?5uQeU>dz~Hj{=Iw%#pF*M4wZzzq*f
+z6_R@T_he5tdgpFcGLXd=f5z`PAxC{M@GnOUwhcc9hrz&&Kj*K*GL8GZ4hFtDJeuQP
+zCkZO=0kW;iPIuCtRmKY+ODK<P+pBkUK|OE%OUb~IByM1zNG$VHV92j@99&bG^Rg%h
+zL-l-E$H#d^QFIefF8!mMx>e1&e7_|#xCrlmYq&QCF3#zRqvtAYKHG6_8~~(-eQ29n
+zibpyONd{V38%4yu1}7s7yjZ=2Ar4LIeFFwI&Ib@p3_Us4kHElpZJZp-+cVy$fK*|o
+ze`0mzLPRZ>kY1`7J^k9}wYl-`7m|Tfdsfk7H<4L<6$~^Thtu6h>^UDD0|U#JJgTOc
+z*k%z18YI+u^SI&FG{V4}{qFPI`w4T5o1!SoHEPoI^va>4+h}BSctLinwYpbyI|U|2
+zc^c%!KH^1P`VfOprC3n2k-rSM_#1;s1-N9i$i@mF_uH_q->4PAaPx~Pf3OS;Brf9w
+zPEKiRdchD41mCwo5|TS1>qxV84S+M!rXwW<;I!mPDXkLlqz|M;JSBA*AO)Yf<M<@y
+z_=(t#35dakM<Wjc^ofcmq}`n@{g)b;5Ouk*=MUqi7Q(EE?s?z<@PGye3=s(qkO2P!
+X7T~`SqVzVY00000NkvXXu0mjf-*{@M
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_18.png b/assets/packs/Breach/Anims/Teto_128x64/frame_18.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..879a03e32ab237fc30074042266ee3b66c885af3
+GIT binary patch
+literal 815
+zcmV+~1JL}5P)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008^Nkl<Zc$__w
+zPiP!v9EP9ycH&OcO?KN#w_wvrZ6F6NSj4uV?QRimK%oH<dJqgf=ta<|5K6@zwqCWV
+z7jqCc2mc(+$qE)SrO*fp8+wo^OEZUJ5Q>>>qC1=He6NSu?e*n-9=;#%ha^dFOHwp;
+zLoxt}Ee}oJUjrmbwn1EpQ{5djNQ3h9dZl*xaU=AvKfkPKPU;71pTrB`bOu4s%eT&h
+z|G3e0ogc?4>U0LuPERXK7mj(+K)Nv!72nw}eKkPt<#i)|SISF{06yP)^H6v1X!^`r
+zA6b}eYUhfgje&G=B4K!g6JB3xPc=7`?yIFg^rd#Txh?C-zT8LZ&MG*`;$AgFqO+5Y
+zZY@O*av9>s-#1bzxEq%x18MZZ1f7uT&!xA(K!@W2!y(l97!0)1d0>fga@lc*<Jn71
+zyRQ43D@(|}f4$wfWH%M%J7*+hlhH4iU(=i(7S)kltXFfY1?vWH{0Cs@6@!?-n5oHY
+zJPW9s>Mz~Wr$dR8-jNLM(^%lb=_hn^8jzK~(=A(U-FD(3$%WbC6>>cH@I#eG015lI
+zeNm0D9CA)Fu$(U91Yx)n7rz0d`LB(ANe>DaTV5m~HKT*}>~d?wQ8ATV*gADkw)ES~
+zA*W~!j;PCAJAU$o;(<TEU6=ytP7dq8dapKmRZR)$r!lPm)J1)9e$<y-&>#DI)sttq
+z>9=!WVAX@t?(1~$VnAByb$8#(ozUTRh9m<=x+@bqg_fq6Ig%}Bok#exzi%%8n{8Vk
+z_6p<3E3pFxs2=UrtC$kw!x<88@BJ$2pW6CLh75U3AOf6MGUT-Ti$`0xIo5YzpX?zb
+zvRz=;l;&A-5-9W=Z7-#Ya6X#B0Q-hZqt$T%2SN;BKI7^P0Mpq!sHrSHLW+DLDJPYs
+zgt<YGm$s#tydqx)NT5JH#shGH1P|(>ME2>DoV3}?Lq&lvq`j`Rl^Cd4d>Ke{kWVaB
+t+u1Fy8?YNVz$)Vya0uCq4Fn-o{s%>A@yTc?XF&h}002ovPDHLkV1iM2eRu!>
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_19.png b/assets/packs/Breach/Anims/Teto_128x64/frame_19.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..d415f6c3c1decd8a4d2a954151a917a2f159971f
+GIT binary patch
+literal 816
+zcmV-01JC@4P)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008_Nkl<Zc$__w
+zL1<i67=^!kXPOz)Av2B94oIDmEOevQjieUZN9aO~&@2R9C>`j=ozay_ZC*9dc4a|r
+zcQsZQE(8S^ibygRB^9xW;KFK~d2M5pK*&6kapooS-a9VtjN8Nc{`22^ek4gc5m%&K
+z<9*2jAZ8w6=grDXfFvoMtDDM#nrEe+aG{)AxLl0(_Ynq0|J?d5%m@D?OU3AA$aVTi
+zRLI1KpEPl&k3_9RuQbz42u=vI96PuHYmf!t-rlfuBPRAji~xT9?t#{GLuEa+)I*le
+zXTwq0^7^r3$0wAI%X}$i-BV7*m<0{dPdW5q6_w6x%=Uy`;}xLk+c7sI=Fv+#N~-hC
+zoZIy8=rs5?xOHF2AxFmU(Dm?7o~r^<-1%YRQmdglEJzkQ`AHb8QN_5}n@N>CHHI0g
+z1JcFdZeuZBRAkyN<;JM$J{M^{{A>+S8XdTziR6us+sCykq1f+ys$cY0XWOVLSvY&m
+z67y4O&%62^P?Bgx-)L@c%<2acN-FwHU#Ge6Q=(DHVgfScC>M@o&aDATz3KJzup0Fz
+zd>(R+cLIzL>z=s=7N)!7K=b*3!=V}={Sl3)WAht@Tw45DLRy`@KY3cg<M@@XWMQWk
+zl7BV0;stC#7C!L}x7SWg?c0C-P8kc;oDU~&)vuf3DX?&$jqx&9X=RP8@~=&^`&v7v
+zXHJokEUcBh8I8WJZLid;GW|B*YMthF8;$@{Q)dP!D!IHYxuc8ODpb^6ZcM)Ds{GLm
+z4%f)eRS!<Ovcp4hQPQ&J7o8(K#tNd%LeFte>r$i_6lL7dM7O2YbVQL`41=HYIh&Ao
+z$ZmMIu7<4Q#5wky9~tnffNce2fq%03eLgbqU^%crc$F_aHo<)49#^iDhcJQI3F`pd
+z<T2J<%C@wl_i7XsRAhkyq)@XZdLI-6%+xIeU?CX<cDjCC#a&^NO3@T>G^Qd8rr?wP
+u3h-8XGum~yU?>q%1t|@VD#U<hnbv>V=+exGolvg;0000<MNUMnLSTYO#EEtQ
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_2.png b/assets/packs/Breach/Anims/Teto_128x64/frame_2.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..5834a1a904e1951c9db02e232d4c6a9035388999
+GIT binary patch
+literal 788
+zcmV+v1MB>WP)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008pNkl<Zc${66
+zPiP!v7{-6!H`ASoDP*BVw-TAH3hkkifFKqB?0`ZkdWhgfJOob#@esWzBJPwT4I)~>
+zgB0xsp*KPB)PuOwDkVw|f{KbQ-PPbObS2ZKZDzMK^LUt@9DI)tzlZPr-uHQtBq>o<
+z765Kj)l~TB|H58e;H2FZ;{GEc{qEfew-n|V6OV=D>MrrXb~MRf!`&6WHY?7X&*~wd
+zeBGGB94eS=Py3K`^7KpAY*s`T6T~=bS44g>P5LIQM-{Pc^xb+qP+AeUxUq8N_@|^y
+z8ymoe9*y{^vYazx=`&q(tM3;U7;)hKl8A9n-;yr1(?YVK<zi0+#CT~0QgSynhwij>
+zv87Q<7Jl0tzEJoe<bn&A?d#4L#PsrmuK<$Q+k5_ezM#ZOY007+%~6CM;^)2xmcpMi
+zm*7S4xeqLO2@Uv>Eafa%%pCyU!zJ)TEXJ}!AqR8nmj`1kd=y#^V|q?Fnh&v<H-Iyk
+z)$H>{GhM@9M1}*bttbX*uGrL{#m5^Tx<Rueq_6rj@4j4gZq^#DejubyHdC}(-DLLp
+zm_RNJTw|{8>m8hY(j>&f+dy-XwLE!?7*w3X<WF|5IVK6xKo*|yAPc3|@y!fS@y9zR
+zf4VdOSkI5OETj`7Q=EJ5?6GyoyRxuWhwz&{N3)=NI|k`kW{Tx~fi8FAOtNrv98s^G
+zAqEdDL|#;w?Nv-th3<QoWHN*%kB8-MkL-8nq!SCjQwGLF7w%a^EY+t2dg9l{IK)J$
+z_iq`8bT*llG-zL+l!2)Y*#N-VUs~kPG#DeCzo$dCHsv}Yv-eivU$66}df@l4fNLL~
+zuw)9j8G^J^8*hEvl2Aq<3)!nt{f8J?oFQ1qy&5Y}2>H7Qv?E<XDlI)?fGZrP2^LHv
+z<O5bOFeC&Eeh*x-CF-mJ($3F2+L9L$h(Jh*GmugXt*l(O|5Ssm_Y3?m1O5Zw8;f`m
+SC@oR|0000<MNUMnLSTZ*Ja0Mx
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_20.png b/assets/packs/Breach/Anims/Teto_128x64/frame_20.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..1b6e3028434c73a8f3c12205066e8975d66c0fcd
+GIT binary patch
+literal 801
+zcmV++1K#|JP)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008$Nkl<Zc$__x
+zPiz!r7{-6|b?eTC>TKj7(UzIUgYlrnsL=><hl5CBOdAgzbrmk2@XuvUpu3eAE+iPQ
+z9x#LhH>(#7N$F5SdNCGbA|$QsU<q3TvO~9Yr|j(ac$i(UzdY~zJo(<|Lz1NLqocCE
+z&PwFq1E?g@QK<lcPELL`b3IL}kSpv`<<!fIN_P!M?5`)1HQ@6h$PO2?H=x)Zg0$eQ
+zPE=&Ok^vw^7k)e#++w)2<yr5%CtV*ZS`R;Nym$mVKUADK-K=k{%T5iK?s;xS*+)u_
+z55eox%d#cwv<JYxw9-<)H0upP_UUv-)>UtM0QjuABe9q*=e7@O4<oQ;Iw2U~TrH%B
+zsg0M)U_i+=a3Q_m27t8FpKCQA)fGWYGH~Dd`dCs3h;aY|cP>?Fu#fkcxClr;U3t)a
+zN5}O~u{$LhSU&Va(7;W4Pn`|{*|_qzR<ytVr>C}Lu#@u+slIfd*`xs|^R=!&ba^yA
+zrDX~AJBqccbCoU5j!4KZs-;!ytvw>yB^ijg%o63>uZ)yaK$_GoP1M`bRD;)~0#xnA
+zZ9%xZIu`*_^JYoo-R&_i@!pn@+Nq<b>&e)N^?s2II4(@wng6i=WO*MLNJ7~7jq~9Q
+zC%`~F*MRrKWUY8JSCrpncIMS@pyb3*0Pn7Qk{9-$2`~Z!=4#+@Xc1goKw7t7ycs;9
+zY@voH85rL@9OBSV-XcFk*Rq7K-oiruVz4xJWN$zr@vnq=gJNgaleA!MGgp+qb+&+e
+zIMw{vzdy?X`ZOG8FrvEZ+O*FrUKtdoenV>8QN`Y%r&*Q8JTS;19jI;l(x|$F934jg
+zjRCSa&U5V5UCHiN>iaUlxPt|IpU3{nb8N+=uqMcIaLsa$c#q>!%U$|bw>1~zDfU&!
+zd-gacrp*68N*!CIP*Ie-9E7n;Ju(<n`)UJw!$P=|&(n)=J^|Pu07*alQs7WlL`4SZ
+fM(~|Thza=*^Y;Z&jG7vT00000NkvXXu0mjf8xw-h
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_21.png b/assets/packs/Breach/Anims/Teto_128x64/frame_21.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..7d29d79741d39cff8863f04c7b6eec82189f761a
+GIT binary patch
+literal 814
+zcmV+}1JV46P)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008@Nkl<Zc$__w
+zPiS0K7{!10&WkhAY36}3RB6n#La7oouB?ceS17nBO2ADwYQQcEBB{E`LY!x*l0~2c
+zZd{0s3&oYqGTJ2biVF*BGH(2X!MwJCri(gnnlyQn%-rMRP23*N`Q3ZI?=u2m;jhL>
+z^|8@L0+J+s6PU}XbX&3j@WblGjn$wt06n4f%)7_`jJ!d55qBcLHVzz;GNEJ5&M=t$
+z10l6kSFT9cBoBbL_e5>us2yKCVBE>;a?&ULA6a>2rMdZm+>Zy5<%aRQ!kkWf|ERt8
+zJGL2ieJ}!e@oKTiu{X``Oy&@qpm%~?*n1^>{>)veSXVPE*IqozqmV{SXXRGEASBXk
+zynO_aTxIg>pZDHURCPJYf?J*hVwkmu!NRURYw=>r4>$rA*4mE;XpE#x1V~qIw$3!W
+zQ)-j{NwQEo9(xP+2K%M$23T}zh<Uiwu$|L$fShS=>5i7PRni}lg#lk|V7!Okrvb=G
+zTl!o7^mTHYk}QP8z|-Gf?4CaiNL3|zL#1DqNuQFC=5$WO^=AB>;StHgm>b5-os2i@
+z6u<+uW*p_u59Q080}sYpuusl*YPtayT7Jr>^E;)zSs$>FOhR%go~R5m3PxNvk@Kyt
+z{x-3Gas~_jt8#NM$HBm7-<<`d=04r2+n>16_f(NQ*h#R3p_f8mMqr^hGVPXz>mL~m
+zfb<}Zmdkmymp-H<dEokk`*8_}!v_lw-|~vZ8imfOG&s1^Te%n@pKZUJPJEe{bgkQ6
+z&$fT}g|8M7DP}UekKOh9O{IF>q0CW;0!LGrkLf|n_k!BDEKmx-0|<UCPXHujLhD)g
+zHf215N)~Cfj_pM#r9=#pI;HWp^lwg4Wkg6y^4gZxjJ7%>vOqG8g*D-IGU!kh7kc+h
+zA@0wh{U+>2?t%(~$wAw&Z_>v2UN$k+rDP?KS5cHfuZQ&C-=_n;0R?mP`3{11uiTSB
+s4PcWp7U<4nF!*8Ib9f<yA|WQ=KTb!n693Ip5C8xG07*qoM6N<$f(lTL&;S4c
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_22.png b/assets/packs/Breach/Anims/Teto_128x64/frame_22.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..609d1e629c3d21d6d5f9e4b6516a0031fb557788
+GIT binary patch
+literal 801
+zcmV++1K#|JP)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008$Nkl<Zc$_tp
+zL1-LR9L9h1cH*oxxKoiP(wLp<A@yPwPf^nDv|bd1#+&HD6$`xvy_L3^QW5dc1}`2e
+z*qaBz9s)LpwwctWT~K5Z524y-r0P}->~3A%Np|*q9%lFY<NLn<|GoD;BuV;Zb-JqW
+z7E2O2_$=T~R@DQ^5ddrVUP@p2wen007XZwqw|_oRVGDALEjYG}mzr@#=Fq+v!R#2M
+z4&~b?tY^oddqLh>y=>2pLF@U;t@J5rC>a2@gEyMl9IQhQip}h`$HIuoG59fPGjT2A
+z)_9MZQ@hgYMtpFTu{jeG@oh{kSEMs9&t=lb@9OJZ@qIIlfea4kp=auMu{CZthZn)X
+zF!lr7fUNX>07(C+*!oIkC8f@UWS}>!+=L2#*Dr#Bwcleb0r<QKNb?uEr~c42?NS&>
+z244SyX@kq))2smoeUbo}hCSP80J0@@^+5Nv>*=y&U<X43$JJ?;z~Gz&jstGY4}i3x
+zpLB1<+dk)HEeR=7PtU5fbA*-i5>h;@Yqr`?rdZl9xiJ6e$T_(3LNN{<aG~fFvEj+b
+zC!S*;7}zbMmH1yX`=nh4q)veSe4}~5$;y9A20F)L(!0T%I{t7A3`~C$JIp6r{w;R_
+z4D|oPUMbg@Tz)#sK`WxTw^R+B`?=+b@`B-=_dtj8DgC{gt$5Ypjb$Vu4TQzh;KrFl
+zk_<SGyY3coBm0{V1`4pauLAbiO&?rf@-5@U5K@ivx9x>HJzy(LlN{W+ej-9(U2@Ap
+z@NhqSo?nOxVP2`L?M|s>=j3SA({{h5OLj`$2y{w=lD4xcOTHLQKJ*E))Pa1;(e-A~
+zVGlka0ZARtF1Gcjr=u#5EY9XC|7E;7%q`Ug1~JKy+5E=nhLF^+Qw-8^*OiveCzO<w
+zNB;#LnZ)?xv6~Uz!H;4SFgk4zLwyis5a$`~FJ(KxN=BZMR-gmWBUkjVN;L;xF;y8L
+f3m`OfNC^2KK5D`=1e++x00000NkvXXu0mjfMs9*<
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_23.png b/assets/packs/Breach/Anims/Teto_128x64/frame_23.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..363eb38f9400eee279bbca665660fd39f5e9b4e6
+GIT binary patch
+literal 809
+zcmV+^1J?YBP)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008;Nkl<Zc$__x
+zPiP!<9K}EL+a<Fp!C7f&qlC;Tf>cTqAwsa*%tB6{1ikdu+^iS>V~T~&1_R>77B70S
+z5j}a4q6fvsW@5#rSZhLa5JWPuiAyo!kZqbxcJ}u?%&gbP`@Z+SeBT#IlD2O>5-KB-
+z$bscc+|aBoNd^EO{(57ld+qKn6pRnOiC5l?v0-n-nSJ0tDJ4=Fa@zZ^?l_ccaSqrz
+zpH3O5)eDXNS?jHSE-5Np4ywPd9i3b<^jw-w>*@RblI;cislRnkHR-oru;r)vjxZfl
+zfgJdt4s6GKR%kGM=f3pAndDGDvSA0-Di8;}kuxsdI`)!{bbVBRNCuQX!3CfTRWQ)0
+zuN*^HNKAJMkp8j*FKo$I;wz4Xbo*RwZ%dw1Fp`0r&n<ju_?SwSG9XQOXPZrZqc)64
+z$a4N(bVpZ}HJr9&z?}p56Z>BGWhlcAP-W@yXX(ENNN3d6KU$y48tO_0rs)t9)EhBv
+zK)R%_^h@NdTSqq~q$Rt#cv)^UV&ZiP>EF(rMi!Mm)Chl+keb<J8VNs2yqJoF)N1tW
+za<td*HZc-Xieo=H`L}Ub<FZtSbUMMzZE@h8*arjY-8s^=U_2T;H3$a$&Vs`;$!hTE
+z&zpd>-K0Bu`?atVxOw#5p>b0=JRBc6U0DDFRUL=l$D@GJ6M(e$e8Z0QMcH@fO1@ME
+z^Toi06}R4PaVi8P%fN%OCw+e~r2Mu6?ex$XuynSX-!_dmT}daeCSJ~H1uOs)3>OS#
+z(~hJUJFWGiQoG?I`&uz+QfSPqCw|Mib}}qlcw?`li`k4tIgogrmew;bbBi3DW{@Du
+zKgR&W!9oQxO79faPL9f#w%u%3^SQ=#P0pxYvgfUzyOfmqy5iVU=I7CCu(G_Yx8KVC
+zf5JBJrjD!B@4acCXH#d06w1KHe8c&+CJV(bNhoD5<xq{>Wp7?;8;C50#u&6MdHoDv
+n0>Gh4N&u4Do-|zo#f16~s~HL*|Kj#J00000NkvXXu0mjfMi+(C
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_24.png b/assets/packs/Breach/Anims/Teto_128x64/frame_24.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..9693443948c7ebf3703c80f1b7c1f4b02d79801e
+GIT binary patch
+literal 832
+zcmV-G1Hb%<P)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0009ANkl<Zc$_tp
+zL1-Lh7>1vj`IFg5*(tQ45hS}YqEZyMh$gfqJ5kZ21qF`@c*xCGFXkZK!4|!UQ53w0
+z5j=X(n?+-H(g?M9XiJ0=sLdq1YFkON>9+1}clLih%;xleygcv!eTVl&lBDMQPBw__
+z`MW++kfk6Q02ut@-<XRP2i#2Pz4hm?Dl;~uZ@K*H^79KZXA1k4iRkCs<+3(6`-CN&
+zxD<l3q3jR4$saf7U^?y-ow(|+uSu<HpLlTfi5ugiGmcN6s10=2t&y}()DPQ7oROIA
+zxPO>m)I&rurhlmu9yjn*!snT=slizn9!~Z?&V*<5<O&g64N733clxL8!~sjNG=>YU
+zFc(Jl2WkxtM;N#k4!nj7(|0*KjtkfKCWTIu&+{uFm7R30sqfVWs&dg-exVLI$l=5o
+z_@?W4YfpQaHhFMi$@C~v!woqFF1!Je!%VDI9S5X}Zfje!v+3D?HY;)=WGI5@MW!Z)
+z!G$eipqP9xSImJUE>3L~KH2l$&Kuhr0_loOb<{34r=!uYB&3~mOrz!9M(}AlsmO)<
+z=WYS#O<G!cGzKZg(btt$JWz|M$OYo6x-l=={9G1?(yGDIVQO{Bf`Ogx@`=fAG7(+4
+zu(t@(`V|y>cFm6hzahDBr!;Ac&jkwy_V6McQ9m+2%FA#5b>P_VEe98dh6_6X$~=dd
+zH~~n_wy~wb9eeWy?~;U+GV}mnotsm|eok|fcRsw#U=nTAz<}0oMc<V`JoYWPVBCm%
+zF+l0JEK<EreMQo-Uh4P5-wr)VulHKJnQ-r&FXKx4%y_yp+b2G{UN1DQukuDFH2hXm
+zi|Ko!EV;nd&=8$WM|xhIZRz;kd8rYke!pUkBR>XG67)Q62ublF6?WD3dn+nrTRcrm
+z|9Q5XW<tYL8fe+E&$hFQ1<Ua6x%+y&*50p&+WE5$Cuk)Z@ylvh?%0NNFb5dG#DuK@
+zSx7R=ZdFQsOj%JuE|5zg?UIIyvU-@4(6+!`GD{jriNis~l=VN?4dszV7bxKX0000<
+KMNUMnLSTYN=#qZ`
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_25.png b/assets/packs/Breach/Anims/Teto_128x64/frame_25.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..d640ccbcc4458508864c54e7a783963f2603dfd2
+GIT binary patch
+literal 826
+zcmV-A1I7G_P)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J00094Nkl<Zc$__x
+z&ubiY7{)*I-A!haEZOyEx0o;+DmL^`s})QynQ2w<;K3h<ND(&RKM+x*2r&}_3Lb3q
+z<U!3I#NtgvP!Dk@M0?YMdMFaJ6O|b8M<(vd&aSibc$kgv@!@$M-k0}zkR&N>YB&Y}
+zx*^At<NGn56nauIhevnpN9jE@_@D9H%<7R|le}X_G}>LB1V1`v1mV7WL5e+D0>JVI
+zPdqRW8Zxp)|E`~F;I@<lX&BpYekZ9uG#ymSJ7XjDORdGBq#gYGdFD%M4kf=jy+2iw
+zGH-ZGbW7n@-U{eL5x^REfwNm21Q=jzFn-3s$*6Z445;3xPQV{=QUwG3=#e{SEQmYh
+zD8#_;>H9RYkW(>zK)ULgr`oz#Kb_DUu8<y#rk-qP8;V`Ut_-?36Ez^l*;}sopbYng
+zPuset#DNVJ!M-_|=uo1VVAnA4k27+m#VE#SF2KMxI2O;MZM_QyD+KPuJgk6s0u1zm
+z9&j-=oBkRYm?fl0aET}?08(@CW%EaEe7%eYD>6_uKE4jl%mjf2NH-Eo)6Lf3_DwhS
+zWT5RhfwfdIboNFf415tJ0TtrxB=Rw^YK6S)^WJ1BVv!=$UuAQe^6GqH#Rdb<9646!
+zgX@l7-%SDxbgx|@w5Ar;x4!Lxf$!^cS@it&W@qaY^1r0B#y>wBZBO}jfPtq+YI6FQ
+zaZZgL`XC*~V=pZg3YwlT^dtjjy~4Wb>*Kw_Bp5LMIa3@rDz_fXUs<yJgNX`;==NG3
+z-0Qu&ZArVkv7JZzLVxuD_~!mnI*j&5zAfp)OkD{{X?S8yTDdP<Q4Yv%hKhBY<__}$
+z9XaRjsdW{z(8xW)tLmziE(kA|?3cSYq{Pk&!_NIsU3xquaV%(nq^;9`dD1U-7G|yt
+za6YPJP)+$P0|QLFZF#VhSzjG*D)rn}%!?DTJ8XlJy|vh~+mR~+dM+S2o5fbO1Q@W^
+z2_}<Q8W}{n$C@XlHbqat(4#3O2E3GfkE8}k27U+l552?OQrQ8p6aWAK07*qoM6N<$
+Ef=JVQC;$Ke
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_26.png b/assets/packs/Breach/Anims/Teto_128x64/frame_26.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..5e65e504d4fdba0c3ae3327b306ab2bc3608b1f8
+GIT binary patch
+literal 813
+zcmV+|1JeA7P)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008?Nkl<Zc$__x
+zPiS0a6vcnvmzTU5oi?MP5+vmfwSp2wMJQc}Z_>IGv<uz1$xsNoG+P(Ri^jIrO}gts
+zNQ5p$+Nz*fnHN)}i-JL=BoLU_RtZ8hZ_;Tqf4}46y?8el4)>hzo{w`;RttF-S#!Yw
+zU;&_CBQGNW9zK2m<P#5@rizUDA4o6zXSgR<B^SMA7Jg7rKOe};rH1#vTU&kRpN)fw
+zh1EyFt8z4yzhbH{1$z<xMkNy+)VTU?g4s)QN;^(Rul+8C^<1>Gu0Mv0CakaK6ZcJT
+zwq+z2=H|AGoxfG8t6$H}ZI^k9rI=Q>x(YYW3SLgSW8eX6or`r3j#N|v3z~Dsv5;Kx
+z(-;d6;@6uiMBs2SNWb)w+4~B0<q16sWZ|7pj@|WKibLnXqM1`q8*Iv3&b(2@19Q6h
+z4MY^0h6WZFy#`RmD=-veF+n_h8x^2Uw#O!vO2)%h*<Qh7e4r(ZPV47vbvn@wX5(3y
+z^0Any$dDTIf&Hm6lDUlr0H;g>fK(sc)TX|;Ez}F;L29PDi^mF+D@$WL2}q5!IDb@)
+zz0r*zS{BkG#lg{Vx;6Y2ghDcy!9>_dM()JS3%PS<K@)0xJl1xmAq(#v1{Z1JMQ_Rh
+za+{r^4!?QhvD!z62!!;0Xw-Q7!r5E?T6<bZqi$ByCq55vjt{9J3%E1A@=QM-I{#U}
+zhJ|#f8Zld@9`#I&1)39{=`K=?Iy0Hu_3~Ugc!4DHzRo`=NspJl*IXLpN%q^x#WLm|
+zN1n`p6P13a2BYPX23e$ft3^q7c7OadKaal-Ibfvxpqo*;|6b~&Xp7xaMsdONmrC`#
+zcK0*N9+gS<^&HLdjB<(UZ`C%}S@|%dY)$WklABbdWqH82^{Z8I6I8>yH4FIHYDBbR
+zwj2is)RX=kQsZPG3n-!k;{(!@fYf4N+xoSQA0>e-_=5ud>h(5-`OLoUIR;C1-IhtR
+rtX}|LS&UsJ&xiBp)xT^Z6oLK&hV{FhhJm7500000NkvXXu0mjf`m=sG
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_27.png b/assets/packs/Breach/Anims/Teto_128x64/frame_27.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..8f56eb0ca6a781d42f1270600edb12bc36c73f6f
+GIT binary patch
+literal 801
+zcmV++1K#|JP)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008$Nkl<Zc${^U
+zL1-Lx6vlu5|IT)&R^udATubbXH$^1{K@o(RVh|B3qCJRsSj2-Dr9G*%W@oX|i{QaS
+z>!pd{#hd7%K|?kzr3h-<gNP;7-Iz!aqdVJ#WG6c_pNGu`4ET;8-}`<K-g`#;w=Dl7
+zxO;^B-JxIx8S8iLarF0Q+)6EA?5;5O!-0UV-;Y3&q+h(!vOeBA>ubl+efjTHNqTbE
+z(RgMqd{1h$v?CCmy8B$4N^_@0HNKtwBH*1NrD()A*IxJK4JX|`8@glZV^06*f&;*|
+z7p|AyI-Duqp{$nsH@BUp)`p?2gT>);HNqK&I)PlBsPRdR1(wY7haAk)q#uC;3UzN}
+z;r_OB0+3Q&czC_2>(YbDLs__%y%Z&Y4`~|<$0x`Bbo3>cH+dE;dgHS@z`_e|@OcC(
+zdSqX(>YRF}M@yE%_0Mm>2FNWf;9x30l{;{V%oYxyJX2cVD!x$>G3Co*N<d~5>vH&N
+z04k*0TGo6&`=Fan%VJK(h92gOogdi;7H*)y4qJf&kebDc7S(LjQ9qOei3$1zSKdyH
+z*J)!RNz3sh<Ia&+yxTDr{%|Qc66Ko*S4L+*GL-W1u(eX&jH%0_51E1>zA$1l6N8GY
+zl}29GZ>4B1)U;6XsrKuM>$gg^QzQ6tFxR{u=i_4&aro7|!GYPoCN#R$`Ss4FNNp_4
+z*yo6Ubdp8?IyEdr#yjn~0eQTk2n+OMr_yz?<c|+l`Q4*a+uLt)C2@WRB(;yNQR(QB
+ziAxp90?P}GR6Q+3_oaiDr>L45W`%u#1C)XT-^YMwet%$aFvpLM1JHYIa6!ezQUbA0
+z@8W>6K2<!aUVTlg>437Ic#=;15TheASYX2x?=!14des=D&Q`sbg_5h}v_Jd?HKno=
+z*B4T&((LC_agR1VUlx|qnsXKY@yKrsu-UX0r3|HQUlx))qJTME1z^Fo0U2jzaVrbE
+ff7^u@tq1Tg66211N@}jy00000NkvXXu0mjfyPk!G
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_28.png b/assets/packs/Breach/Anims/Teto_128x64/frame_28.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..e9c00fd822f6eba482c1a6af02e08f705e467db1
+GIT binary patch
+literal 816
+zcmV-01JC@4P)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008_Nkl<Zc${66
+zL1-Lh7>1wuGufRrHQi#7HLcDH!IRL`gQZZNsTXrg#NH}22M-D!A_^KQ?8FwVp6W#l
+zRuWJ_@L&%WtJcj#ECvtNDAXJpJ84&%nou{}kj(DR&g)@zbLfBh;o*5d{tw>Y5&-Rf
+zy2oVK8ux*%`$3EYOxru4Hec{rnQI2v8A!&rM>$acbjNUC{QjxVdhOT_xbW4XZ{Diy
+zduRt#-nh1S(K7q#&X6kUSfkvxbf#;hVQ}tn%}vhqBAxk@@wyi|K`+u8`Sa4jHR6AJ
+zU~{}d^28Q-K$3Lzk$Y=8BHfg-8R1ZFFB2h8_MV<A1M9aA76XtJvH#mm>E?-gDjATM
+zJ~-lp%&zW^0}Qm6s-smC@_a-t#K6_u@Cpg+bMz({SXvpLHhm#U;b<|yM$rqUKMYX(
+z>rSDHfvG*$!7SlyIJpo*>I_al=W`4KN?;&gn+)JrY*+@=Nh^2sg?>;IujvV;QbYfw
+zm(@AdZhP5s5r1P4whabripMEoy__zW@iDN#20*!gw!9sJ^jTWdCp!F_aFZD!eZBpD
+zWk~MU*g1FJ6VgmvNFUW)ePGn5A_KRbmgV}?Td#ynVBj5!;77BMl_&Fn()XC|9MKK4
+zr@A|FWw4It9TGYmIJ%JolumUl4SxL6(@{RC+>pV#`yo1e;n~I2W{^f0_;M1g<^H$j
+zo_{q2X)JlYb>gELU77hMmJEz^#wngUi=jCH27-R?UF%+q>UOuMKUqP&6?3KB`7Xc!
+z<=0A|7k=kDhy2V~nY;ABNKwJUmX$T=nIGGhk5$A<Gb0(=)e4~QBo{Ma*SQ9y^c~M4
+za#GRE=jgkY8JnqzY2z{Qa0YhS3q{VW22O+lem27`#;pc4e2`?Cx2v9HE5Vfk27}UK
+zfKp5hHYE8RlW<oM_o}UJDM8925h1{39Liurp|r~0&C|;`_;VP@M{p7*Op#eI;3P4l
+uoDRGHQL0;#Vgp`+D;pf(zYkLI6X1WI^=%64g-w9~0000<MNUMnLSTYlriTsy
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_29.png b/assets/packs/Breach/Anims/Teto_128x64/frame_29.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..dfce57bd8dbe682b46f89f7808cceae8466c5524
+GIT binary patch
+literal 806
+zcmV+>1KIqEP)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008*Nkl<Zc$__x
+zPiP!v7{-6!x3k%aE@lEfL}|MNz0`|M=_OLlE-}=eOb#A;Yi&U)g2h_u3Y8tLhd`yo
+zlj5JYms$@Vya|HtrrIV-F^e9IAarP=F*cY@H+5$=yYqOM-F%n#<H!3x?{j!wBuV;B
+z{bvCn+$m1_i!>M!yC$L6!Od3!E~!Ny)J|OWy4&r4c18{^J+sn!;mCXpsrKieH98w=
+z?3H>TlX-s}==MR!aJLXpc(xBB!}#qfZSHh5FE$FNR*W9@!SX)M|DKWl>|0;<@%MQU
+z_KmsqD6%gH9HZys(?h?gdr;xdmffpOX|@{nxA5eRHEB{>OGW1{c)>21m}Ubk==k&#
+zU$knpJ!SwYR=K&@kxCWSB&2!Ot}nKaD=bD<vaqD1;DoT?=E0)+z1QExfEVKdN+Pp1
+zwWuk@E^Wz@xO)hEe74I&Wk8)=v#C{`)q`yJFUewBc~K)5<*Xe6i{>!+eD7v1lmLq@
+zu|-~)NxtRZ0F;!qs!x(?CZQS?WibnUhi}gPQT0#%1P+|iWN?`E+{u@cBVU75)nIa1
+z)o`eWsmg*M$7BLr8VrDi>+UcKd^B?O=~e&|7>()5zz2zO3bJsKAc+{~z&pYAHIUBc
+zjGp@N*!dbp6(POd9Zs%1|MAe$-Z!=+2fi6@z@BVl!Q9D$1NB?KcIL()305wbLAue|
+zY@d1jfNoz6a*~CSZryp<bh*XUTLBhI+2U*Y_TM=5%^;1#&EfsCgCR@o&!oVg7<+6K
+z;pW;YSpH$RDPd+@4WxnT&fmWzX|<xuX&e&2^J01vul6$Lc@R^?Jd%RQnQd@i9yuok
+zu5&u#OX?^NKvJy5=X6((RuWr~1!lHJe++#7!%U<jnLH=2AqUQ-KD>&~Nb5!l(vd8<
+zu&#g;{b=h==__&y3;jbL;k{8@01Im#OhbrA2uK^P4JpY%u_tQpz|ZY%Kmj<Q@q}Gb
+k0;LD3h7}Ao03v+;2VI)XM4u>#i~s-t07*qoM6N<$f-2vFVE_OC
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_3.png b/assets/packs/Breach/Anims/Teto_128x64/frame_3.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..ff03130578c1d8155e757631bc44c8033f42a49e
+GIT binary patch
+literal 782
+zcmV+p1M&QcP)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008jNkl<Zc$__x
+zPiP!v7{-6|&2(py4cVy{TuRBV@nBB62f-H68PXmUJ$R5JUJRc0AXr53VCzn4O9KVn
+zyHJC@3ijsBoi<`CB2^HYK%u+D68}VZvR%w<GCPll+0A==_@3YUzP!(eBuV!*Edu~C
+z)0zlXc`&jJP&|A-UTNu)QfVT5P^Xf$E+mJ-nv4B-OQl1oV-oAZiC*=PVeD)X*q&N4
+zkQY%KOAY`T1n1ZFM>;#1V|1z8t8JR9H)U)+qpO>?)SEJXu=?BCQR(8eZRv?YYMN+u
+zy2~&B4(iso4Cbbc6YfZAcam|z$eD5fl+H+_f^i$XGAu{j2LpOHn+b{8M{O|hxI2W|
+zm^l8Y4oG(%MmK)STZ)6+NCxh{ylNa`>UT}i*6p5p_MU1=;JD<V-I??(G#Jef&VnKL
+z780sdDSue;!GPWMZbF&T#lHZ9mC*y-rb?xEz@P|t!1~+zBwPf8al@xMhJ88x4kA!a
+z@JL@Mu=mk!AcI8=b%q;H))#*T2P$$P-zi&3-|B$$O>ZWDNu8t?LPrJ~PmNGWvU6^d
+zj~kwEnUJpz-UyNiBtR#>yk4^ZvsVM5+=lTBorO{ytmlCYR^S@ajs54i^~yK|>9x${
+z*UQIi8w;n0l7Y<ukX`Bat?URGcr*{U<|4){e+CBDh%&#_=60kAkU9r;{{GyH`n(p0
+zEg1+ced_EtN#FG2;`+Z=>TPR<HJ0p29F~{nt0?yNvO?JUe#u(F!qe+TKC(Mo*CcJX
+zw(}wmsylB1;2%sFz7Hb;tl2`yoOZ(B@^PI)aGYk!*ZhV?5l9;8-f2CQ-O8!S0Iv=k
+zKSp(Otd9zd=6G+7J>X0+$GMg&(vBrXh2;n|VMh@whd=6L=_anaH5o{NlU#1#(FFs$
+zJ~W_<4}jF)>r1%{fufp_cJ01?P7MTEF_?0nV`&cIusF6690dye|K4t^u;lDJ3;+NC
+M07*qoM6N<$f+`tvzW@LL
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_30.png b/assets/packs/Breach/Anims/Teto_128x64/frame_30.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..ab1b237b9bdbc29162da2b22fad8f585c490d769
+GIT binary patch
+literal 802
+zcmV+-1Ks?IP)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008%Nkl<Zc$__w
+zPiP!<6vsdFo7tU}#OzeXE*i6Yh>&_QBE>CMyHcTo(j4^Aix>~mlca)B1aT)ONDrd%
+z)MyJ0if4-#X@q903xWj~jbN4jnLuO}Y&)&1ncbcJeLYOa>-W9y=RMy0B1zI0lBA?5
+z830%VxHVP+FB5_b4Y51D4M>vg)mpWhNQ=@P;knT7b}Q*v&T#xwzx|YS+sFQA{M!4a
+zeF!(n8R>hDJpk_vb4Fs&2WQkB=8R!T<J=xoiE~TWSNY3=?8V&j!=Z!UC68<Ppp;EH
+z-)Ka8H*jkC*x+KVK3te`>X1QC1BDjuat__s*_3@>+Pnkh#ksyTenzimdu+We;t($!
+z%x9MBrO!G&*%Pm*AQ>1%tA<j`saI~5z(6<MWw0&yJeUQf53k;Jb8hgcB6v$edMtk9
+z`8j)1KL*a0WYFPVp$9K96F(IJO2diGPG|I*dgbmF$-v@u)iC$RHmOX4!P;k?08HQm
+zU~sovQ<QMp?m12ZN~PcRm9>SG=5|vCligtNx*?hdgYyjM@%ZcRHRt02AYuQsPiiCD
+z-J&QN*yw)>A(0nR4>9mS;W$ndwR=bWb@1TE(T`xhI`dH4Uo3(YVpP{<KeVoG3dv<@
+z^z^mW*F)S?LOSTWqp8E6l+W&8Iwcv{w?5&7|Muc*CVc@6Jn?YMg^t6(S)2g_KTpo5
+z6e<)W`XL@*S19+69icJPZ(^W6>b!Y-m{6ksZuTh4Y0A>V!ljAqmEYVuJHCR#z>l+2
+z)TV1D!hs;kgsqjG#Sl``Z?go|itGo(_#;`zJwf2nXBlTY6TH$Y4AjQ&hnYYv;R=_5
+zJcW(>(!fc<%`9d+C{kkwzFxxsOOw3ZK*0Ce>P9*$rH&L=Wq@)>1gS#EI(+H4bQVAF
+zNT9@tSxUrt)(J@?0wOT*Pbmg1x3Ut_&fhn6Juz^=Qk4g3aU3tP&=>#)Mm`7#_=6e-
+g#t4aH2Z(|H01$Db;1$2y(EtDd07*qoM6N<$f-C`nUH||9
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_31.png b/assets/packs/Breach/Anims/Teto_128x64/frame_31.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..0541952dc90857e297cd7a418b0afdf0d2beb108
+GIT binary patch
+literal 815
+zcmV+~1JL}5P)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008^Nkl<Zc$__w
+z-)mcC7{@>7&8az-xSZ&ugLO>`6K~_ipv-Q`{1wHEP5c84!wbEb#42<um}4CXyP1gK
+z55xvhFT4;hgbopV*q{{@+8dcdX*1~P24RayT~4!e-me#@+3knt^L@V$?}H>suSimN
+zHZQpVh`oHIiRdO60H}Je2fZF&-3Ljq=wExfasg6>8;fsmM^~?Z21t_ZX0siEGmugc
+zd)dF=hvIz@xz6&DigvC^X=oJdx4Bd1P-_%A$lt0x{+*>X3SAkybgBE8lpQr)xma<c
+zD<q9kv0N+Z9(<2)8zW_AZB_OKW$x_1qKGM+Fo?sEGVLEgl=yTXnCZ~NIb0f6Q*izK
+zvFLVSJNy@<pi;LS3{1l_J{U;0zWCl7gjAROSHZv_@nO70X@OMP$b9S)uLGHNFmQVA
+zEM@m69_IKu81z!1c?Nv$W`8IFveALw;)|NsZeD%KV7+rrJ+N*l*akzKeP$Po@gA5X
+z2QJQCbCXWuoE$XmQ<I>is2f^}mn$(UNXSY%TC(|#S*JTD8Jx5Hf=jv6Z~7h}owB#=
+zliCU=LQY67ypeqKmJ_t6-E#J4K>9K^c2=9YT0~1iT5Eq|XSDH<6J-<0g@2#OoU`ly
+zlwS6-*5HT*W!^2EIF>Jbe!BcT2C5%g3d83b_Sy4?0O{8w1-p2-ri&*hi;@eOzw&YT
+zW{pSLE`WjGb9MaTEKQ1CK)M?54PVRDG_}Q;WMFb{^=Op4tSap^RMzQ`m)*RxoTR^h
+zW!#%ABmDOM!Ia{-U&Z*$tfWfVzxRiv+s(DrRB=3xA_5AvR5|Yc8PQY7RBv=aevSc~
+zKnjMo^dpy@U2yj&cB38YI5_XrF~Ec4{?}CmJQ8Ang$oqw0GvsC(A2!taiw-qNXkeP
+zQsmB$z(-PF>XID+Nzw;x@@g050+9zS2%k0>*vmmTaRW+(fOKz9+KmiUEJYcxW8g*>
+ts=aiVj0uPu4$!590VfFQVjyTy<$p8ttzDo|3N`=$002ovPDHLkV1ifrf(`%x
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_32.png b/assets/packs/Breach/Anims/Teto_128x64/frame_32.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..5af50fa605c84f9bf4257cf78534c25d3aab2601
+GIT binary patch
+literal 815
+zcmV+~1JL}5P)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008^Nkl<Zc$__x
+zL1<iM6otS4pJ!*1Ow5pq2~s-~vCxH-*)?iNrqY!ZI%^d=(nXgIT{RHM#DWdQjVJ_4
+zG+C)zMJR-lykbREG@}-)G&K_^>7-DZmqa=*?R)=m@n+n9oOAEx-gA*8>0FeTKG2$E
+z0T8!0IoM|ykR-VU#`6s|uSy;8;gLhlg?uz5c>rMEe)CRa!?ypol#do8NY8gIQ8wjX
+zFPf;`1%b!L!lKSLyP)nd{#~Ec>dx_?Pn&<9CMtjtz)#EZncnORty8s5mrn-PE=CQ7
+zt!|Ccvp>qc;Y=5};#yPcacOmnp33<sHyf700z5JP8EE-#G#NeOv-tzXh1FI%v22GT
+zsM`9io?N2HPp0Spm8z<qlst(4x_u9-)smqN7TUH<rq`!{sey&{`vngw4DzfG9<2TP
+z<v%%I;jsyhU&g{Ohp7cz$2;oRz@q-^5Sjj^-eM^Li}T(x6-Za&ugCz3(yQCLtMRKl
+zSKK!eieqi-Mzk^!G4qjx;=HzX!=-OJ!t;{FEMZAS!`bol+!tUmU$cyP#t-+WszpE=
+zao@W!ovRI1%u@;J^LC#bTm3oP9}b+Ckp7q+bfbEdO@#vwB@06@&l*>~GZJTVdw^8O
+z#3wG4)~Mv0k`c3*>6g+=QzJtoCyQ7ZNzFmyzQ1BFOoD|MmqSy!@&gg31W5ND7<ch;
+zTCYu$k}T{DSJ1Kdv{yO;AT^_dCzXD=g%u7<7BXfoyJQgs)w`#>lwH)*Pc?HlIpvnQ
+zHdx1VsGKN*SEB(*A8WM}{@}FTLX7ckNAb5FN}=9SkV+yIYg1~v=XB5kPVdHAbXH+c
+z2LugY8?p+Ib-+~n_X)|$?QX~e_PorkDgvG#t|O^Fq2HuOMq1Cy0y&=y1cIAMPItkF
+zb&j)>47M-rYIc$V)e}n=4ndh5K<6tnye}ZxM`WaSXkkL+Wg!)Vx$MXg0~Tbfcs_)s
+tEegqd_(XvrM?KlPtLGJvqM#*a^dBu&1_&yJ{eb`g002ovPDHLkV1m}yd-nhU
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_33.png b/assets/packs/Breach/Anims/Teto_128x64/frame_33.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..1796ed51917750f9e94587fb587efe433ba729b4
+GIT binary patch
+literal 800
+zcmV+*1K<3KP)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008#Nkl<Zc$_tp
+z(Q8|E9K}DsU$f<At=y|9glU%uJ}6AOClQn-3S$L@&VRs#y~$vW6EsR)t}lWpxW|Hm
+zp?mO29D-0`U2m<l!XC0GCvKR#R%r*@a+j(}x0~Pb;U=#i&iNjGobyAHr0;i(TuE(-
+z47|<JN+NAb766?Kw`XsJyD?-6w_aI)Z&m4}lmmc#<-0F(@WEJ-zB#dQ9P<6~(LoMP
+zm*o0m%OGX`hoAKL?%1;9yV99S>Bcy=^Y3T%bB7^<3~YQp8yBzAT^w7AGuM=!Q8GVH
+zDbDT46`bjgfIHUS)3DIYk3ss@Tu;u^qqz~_d}m+EtqwP{*awXtqXaiaubRbvQ@p?=
+zwy{(Qz=D$N7BA%GX%9f!*C*YMYbt`iWZ{1I;;n=-<(f$VslEK}8*{Fs9;GiOq^H(y
+zx7(W6Zr;sE7QJ)g3BXIzB2_>xuJp8{SDHOvT?wT|+uGF1<^!XyWZ_5%7iEs;KUEB9
+zxTn8$(|y(ahvtNY+^TkT)A?V2#Ne!CF%eh!*#yt6<1K=PC9Z_6@H)MSV_>1?o~J`K
+z`m1Gr0i=$b)HD72Q~tm|DIs+eqr=VkF_Ze&Bn!O&hJ&c4CxfG4p;ILsTw$qtiaHpv
+zW`6yz+&k@meD;q&Yak_lp?P}aeZ5q7P02!c%Tw^;B^|_uU?I2{I5xfoFPsIWZTF$8
+z9aOr~z?Uo>a<fDQhMb@bIXGl1ug9gVA+X?WP5pMHOpa%XvcV+gf-h;sEqAiAy{AnB
+zxXZ~}R`#7sEF(f=s-ulH)l|>Dpg4;qWgmvz0y0aEC=4$Hlt-3V7y2dXfcjZc^e}g0
+z1_5c@A_ug$tOt3=fm76wl$LZyN{!q?Nk~ehd(!X74N9^=;)rP#@n~eR)0P=-CwQiw
+z0SkR5VuI|;N|N?m9x95m8?V9C!$*Kd(_X9M79C#o;pi;_QwNV-%2?oXj42x+9x40?
+eT9zP;sq#N;wdt%zF`T~u0000<MNUMnLSTZ~VuM5g
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_34.png b/assets/packs/Breach/Anims/Teto_128x64/frame_34.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..0c3c375007fb048d928b868b10e9a400da4a2816
+GIT binary patch
+literal 817
+zcmV-11J3-3P)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008`Nkl<Zc$_tp
+zPiP!v7{-4yJIU_W=nNHMk+r)~+LP9ZNUPNDhzEs&iBj-VBuYUq(x~8{OLn3GD-@EO
+z9z^4%cr)n1O0c_C&<NEmO0igNCjDa+Yj%>wX0to{Js!T@>yP()-uM09=RuOB_vc@z
+znv&)uEZ7(Nep_luE&x0--a5JxE^mNmfxozs|E`W}uusgs?6GN}G|)(g9hHEt<OpDA
+zmw9>AnIiSDqFrzD^9v6ZXA}Aw>sie;_DV~Gw(IrA#lll47*w1Z`d(>EdUw#Jxc9ou
+z^VRgg02J1Lkwy(~^np3J(vnWqGTVK?(?@oy8mZ|s3)+XCIg(0L^rCG$_hC5Ou4}&B
+zE`kf3`QY|+SKS#aXCrW-cQ$|&_}KLTsZ|ZuS4>GU9FRQt?cptO#t6!B9b7n{i(Y~<
+z`PgrO3#Xrei+KD~N+!TX4;*CC@ML3mvI-!Bwsc)zt96Thm0a*6_>-BF!>`i-WV-rU
+zmvnh3{Z``=GOKFolF6Q(=2`neRbA5`#y@`;bB~1diH_?oHRJse8Oen)Gisd4Li~3~
+z0X*2VIomPi<Ua3ij@k9yFzTh<D>qCn1f)%zYN?Xk;au~#B^R2LFm*H@*S)0Rh;vTe
+z1P;x$cy+k|QgYjSz5Bm;wOYLTgY{Tb=)~1q&7rC3isXS|Ov`tE5y9I67c$B@y?m|u
+z7BhegL!Fblk&n{c$d}d*9nrzp_M_dt>3Vo(q$Yi})LylxOt_M%gG&}b>a~N9vXYj1
+zugG41?R4cG89mrD6$@^T*Vfe5YX(`3p^30ZQ?b*Z1F!t=V+)^h20!elA^fo%0wh?l
+zxqr{&W$<vUVQ4sRX92Z&js=i(^TgpDX(OY!QWBDqtp1aJchpKtcJw!KpeVf5itZLp
+z<TlC0`9T`AU73mTyK!j{)1BCj2|T;4YSQLUS*WOPE6#=Fwz_~qJJ>|baA3%Vo&Ito
+vpn1sg7iC-^vxpNo5XJq9B!Vdjhza>0K6UMN=NYB600000NkvXXu0mjfYU`Q>
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_35.png b/assets/packs/Breach/Anims/Teto_128x64/frame_35.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..32e5f350ced45cfa920b5d1ad14929e01954679d
+GIT binary patch
+literal 815
+zcmV+~1JL}5P)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008^Nkl<Zc$__x
+zPiP!v7{-6|Wx6}nr86373({uAK;y}^7ymRmi+^fP(pymk1BU9&3R)DanbP7#Xd_;P
+z9$fIygJ5k9#v<uXL`cEIMo;nYZrSP<3}iMg-A#7(dpyjp*N6A_d=KyUyhxJt+roIL
+zGuD^LgipvlpN4AwFI=tNy!LNRpGqzOxW``1?JY3_*@PW;u7~V7ZAM7ypbHTk93d&}
+zFL_BV93kzq^1r?n+S4PX`QX{r+vCzeG5|D-b4eiw-;R*;<4xIjW&avY*rJcKgfj`5
+zuyD8wbMa624uzG%(?P`5IGN2ndWDA$rB!|SioVD^YRObgnF35@$f-qxo#mUx;5--@
+zTnWH!@Q%icfYcAYZcCvmes7m#U}L%TWlTV+?YUs!N+&i@q!@4*kg8+tR!d9T#_3B2
+zuHEG=fJ^^^eI1ac+g4Z0t6To1k0fOCYOAR~wVl^R3E6FJ=^xdf=|$>G2ImA02Clm?
+zzh|%LXZ`X1Sp5U1+LDmIQm1-A{>B03f0PUq?HW$`cE^c6J_-gV%#&rx6`XRi1ul5o
+zGm&NP?p>33fRsdzE`~|&(9J;>J*kL|s1dw0_QV3XKzS1H*W<^kOY3DYu>VpD5A#cK
+zgAy3%-tnm1Kf?<rgA|Zj^}s&5ea=pw9MmKicJG^V`26Jv?s+5zsk0NSl%F3gzKJBH
+z9bw6<zx>wYk_?y!+>Seg8|7BBe-Ui$38f?bcp|G*AxQF)-uq7Vtc7ont);;FJdGj-
+zIJ)shgh02*JnF4lqMlw&)A?a7FK;G(%jV^1C~S6H`poXLuMLI7@A|5z$L%nwV*kX1
+z)bmA_l&2nBFDC53DH<Rt$=hk^@4TipAp@-8tVHZhd2W!k@W>)Ih5-lDY{_?ic$V4k
+zm+*S+(KV>Ic_zVEV`6v>aGzNtfXrhhBES1wOp!*0G(zcyfzXm6{wz#cys{l4y%I{m
+tqchw`_p&tW5GW>;0s0jv8v+`X`47sp@^ha$iC+K!002ovPDHLkV1i)zkm&#b
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_36.png b/assets/packs/Breach/Anims/Teto_128x64/frame_36.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..b93da1ffb7ae2def1b52c55350ff4aa46d181b59
+GIT binary patch
+literal 810
+zcmV+_1J(SAP)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008<Nkl<Zc$__x
+zL1-Lh7>1wuciq{9)R~}%9HcWrkqX7+5F}t=)|28vgdWs`bS(uv2J~R1W;aj>;-QF#
+z=F%$IgPsg}EF}|(H3zkVJ=7Z9wON}MLo>UH?o4)eUJo<t_2K)z_d7f<k|gbIO$JJ7
+zNaWy0DnDphCCLE5vA3`FhS`OrNip%M6EAf)_M%|4GPZofn~|bGWdPLISBqVX(s}Y5
+zS&g;ZXJLWjMzWDQ-7lnJqewZ5bgN(6uozA3P9OZ5j!FMEij*5;y?rf6w^gKUK4Vv?
+zqj8Fq4{9aI>ekg9$a3F`Lr##a=HPDj_^oP<uuVM&U;k`{rp^nI-2elMuGX5shY*2*
+z!P2V_P@B3Lehf(W9!{Lvm8Zy4*iaeno;X>D2>!GX2KGM*578=BmkJ=w+wpEc`&Ma_
+z<B~yJ?{!zVtqM@O0|x91AUbFzO#o#>CEC#+O6-;IC4+T_m~pJLrE~E-7^q_i;d2ub
+z1Jas$`bkzRo7QiV0bjlFCKWem9h(BA{XtpB*Y_i*8Ei^OyXkb}N^q&|gj6M@gK$h&
+zPWPM6J&c4D`RH=+cj@VFyDS-q{1DUpOK(aE7>G)nM0c1Q@<tU5ID<0G_>*hT-rNSH
+zy}qlN?-qkC-yTW^{;8g%>OB#@@_ID|1Fq)a_qoPX%svDIk9_1Rd3k+l(b}2^q$DjL
+zxwew)@7HoqGw78a>H5)>a!)6G#%F<zcl_L-DD2n`>G^AICs%u?(|JtNyMy#};rgLJ
+zDe2Up(JH`$OQGWI$zigdgSg-7dIy=EJvyq#N`Ih>>1!FvLE9c2sFhw!?Gbo!U`w&{
+zKS=GqBON-~a`9=$t-27$yo8SdCb#ioCQ`mpA%96jPlr}kN<A5%yMTV#EbF=R>8Kux
+zA;MPV6>Xs6or%m85tM<Q%T4Rc1!d6ASMCQ=YD1u=CnWVhlVU@)k&&k`3vouw5qUkz
+oKxE-^A0H&ej#Mw<s!5>#08`2hjTkbY>i_@%07*qoM6N<$f~&!Ur~m)}
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_37.png b/assets/packs/Breach/Anims/Teto_128x64/frame_37.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..dddf37ede5c7823b2e063a902b9a535925da58ad
+GIT binary patch
+literal 818
+zcmV-21I_%2P)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008{Nkl<Zc$_tp
+z&ubl39K}C#XOelrnD-(`BZj=FxUi(Oppr&IW+FmYg3v!80T<Ps)kU)Mja0BAn!3@A
+zScPtdEEIo$yonam3TjFPTgAS~4-$$c8IzJX$(y;y#k{QU<#4{|d+y~NBuUzvcgl+>
+zkIke%kO(9X0D6zN-(jiYK$mfMJ-uavwhfL(uAj-L=GU^x`Vm0XsedD-GhM(EjxUGc
+zv}6FV3Acu4VI;v3z`;tp^3dTJ#9_(kTzhit(UIwjj@GXC9Ne~^)M<7_f9`v2PQy}u
+z<l~o#Li)6!v>^k?dEq(1sf3$gfHhTS3_P41yjTJ!w`!}*vX=4;cu=I@^^7{B^x|Iy
+z1MTlCU>Es2r5%Cv+qU<{O<mURpq&h4;8$}xL0|`*ufT&Vo8LBZ?onBFXkyUdhZlh{
+zydm5e4;DLx{|6iJYSa$~<T=zak%^t1(ilWA9qK3h7Z{vbpo8<dq96MJsi}2+sn!=Z
+z4s1gPR{5O}5@rFAR_vNS(AzsjP5Y7o9XuW{Xuz9({n#cL80mQ|G)uF^joMRQ1kzUY
+zo<0k<(rQd^AOpAKIS6Z)_MhM|!~-JKfeY0K(?KwhEMIlD<GY+h77R?aJt}8w<Bf|i
+zod=|Ugcd%!;a{q|nPgy-(<IN<=W_=?!oa8|sGK++Y1mVQfxhci`1l;}bL@FQ+RMDd
+zQ@z{v&ZN66A?2`(uj0-RqxEi1o!x<HOpE*#FyJN;P6}`(F8|a&6W)&j7O$0&Dh@W@
+zlr&M~emDFXuB5X?W2Xe{f1j)<d+X`k&U6{?{<(R1&$<e_eM$XxM+^C!C6ElT5>~S4
+z<$TCGad(T~IVYvn+&>x_Z&zE|s1~kTLQ=A)`i?TcSW;Oa>uO5ccWoyxfz*|)>YiiA
+zvu?$j%H0bYo}bpsMup^$6d4aBY5Cf(BYOXJQd1iOJfJ_0qRf+pq%^kElyV;eMWtxF
+wC1r+6!%~XoHOMR(yJe)5SEa<Eri4KM1H&KxvSx>g@c;k-07*qoM6N<$f*8k&`~Uy|
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_38.png b/assets/packs/Breach/Anims/Teto_128x64/frame_38.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..49712a65c7f6c4d2e62fc75f4d89c4a2a6cd190e
+GIT binary patch
+literal 823
+zcmV-71IYY|P)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J00091Nkl<Zc$__x
+z&ubiY7{)*Iowc)@tW9iMNTJ<Xjc8G@y(kf)GwZ2{sPte#kX`%-+C!;O!CBjjH@%5c
+zll7v4AoV0DbSJhnMJ)-g&>ouXv|4SUWhXyOX4BbuJj}-T`0zf@_j&m~50WIMZ4Ji&
+zfI@aA$N!G;q}Y=RIlSu==P0Y=z>vcCXP)6x$!EB+y!qbgUu_1_jz%-Q;=U*)o-6@i
+z`7iBxeg-tuP=nb&Zo=3OB@Gj&-;q=w8XGKa-CVEKeRf{ijz>lwF(RuDDR;{KR0S#X
+zlml1x_odlDNm~Yxb$Q%|=ipv`T$JoRmIb=wrA}K0R9~b)L^);>3~Y!0?yFH{Y21!N
+z4D`+vXy^h{4N^e*;^MCNJDStlgl1hC_}sj39VKLC-i89I)z%eR3CS&rbx?+TYQ3Yc
+zm4ek)0qh%tQ78lc0-!8YKj`Q)Wj>xK1M`539qLlh2BbiJJ<!VW^js9TW#9qZgjjdY
+z%bpDe_9A?Eg*u~PU@H4Pj0j&>+^|9lFk}3OmD_hGzdR`c(qdB6!MX05bHhzNA^l7#
+zsJOii=PH&f0~ebKRJqSVa*EA-a6rAYdsbuSWZ<2#kf2%o@bJP3r;35u_#-yHx>j_<
+z?j|7pq>|ovI(lNsvr|t7e$$bx`tGGcVLmj?JPwB}?4!}d0pDt3;I-8j#aEB<&D2QG
+z2Wc@beQ?sY<yP#zWMFD3p=Gx9UG>r3V4y^CbHf-t7N(O>04y$yj$?@4TF!sJS9;Qs
+zw6YQ}<k8-UzkL?yKAz5`7@)9qej2!6?Oe{YzAwIh9-3DPj|}VK{17VEgnm4c7ijg+
+z^ix$S;aWA{2tU@Ay6JJ@Nl3bVcxzEg#xi@@xokRqGb90MfuukG$z16#Cky4u0Q-F^
+zFqzUC<USrYEU!hHS<C7FHSLde6HbrDZXW(XiPelPXFYOdKs88atXPxfyth_JbN4T2
+zTR@a+ob#mAq2Q^RYxL%%#83<}avzBgNk+mN@E?&6*ViTM_t^jd002ovPDHLkV1mVr
+Bj^F?Q
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_39.png b/assets/packs/Breach/Anims/Teto_128x64/frame_39.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..55edb553a4b52a0f7956e4c65b57106e3522b9e5
+GIT binary patch
+literal 816
+zcmV-01JC@4P)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008_Nkl<Zc${66
+zPiP!v7{-6!H<Rq9+GME|gQUz}gb0H5mY{Z~MW`Zzq9-qn;GswHprsHqvBh45#E?S|
+zLQ*_<Y<sd;%8sRoP^l}erQn}gtu-sObas=_-DKu_Jj|{K-^&XR&+~oH%lkg4ti?eW
+zWy^yhU;&_*V^}5rxBkbdbWDtlfdO#;Y^BOoxo9Y9Kfl;fprt^5$@t^LH$QdP{O#tD
+zvH0zc@C7MOWdwkU!dfS0qFJ{?8|!!G@Umne=_T33#Z76gF?h7!)U6R`7UCh}uG#5q
+z8Ob#UPW`I#$2`~>I=x$Cg|pBv0gZn1ju&$<W*_*#)yr=;fc@xkuuwF@>BPol7fhC5
+zVLP6G(4s{TT!Mw$z4z*|sq;(5KP@cWJX0U@-31PHixsfw=OZtg%w~*_d#^+wmzk}v
+zHngT5kjmm}FZmJF@T+)WF~LPMS)+>WF_nOdZS@y6by+ULg+fm1YeQF5c)B#0b_XBx
+zy*_Twg2fz;A;X-ojhS(<ki=I2j+oY9w~gYOe$(2ILc5_XWacoj+SAL+=2Q!$G<$Xa
+zfYNT|P7tpN=`>^W2cAo}M($%mAsI|D6{fAx+c675?u=P1rj(v~;&{)bvM@W2b+O{t
+zS7#g`SM<j;{@Q0x&7GL|Gmyoc{I13ueqKHP^#@ZCNP(Nxu_v#Gw`!hJS%~s!)lU1#
+z=F%tm92V9`rlC`%finpf=&WK+zKqY_kILO<nM;aixfkcF<t1k$xj!NI@Yt72<t5*w
+zz2_jN#r~C2GK=4jV4^mf4vzm`a$VBz4;zbvytHl{mGrC5?+(&%{_`BgKaee#5*GyL
+z)YUWEcqI8im-W3AYSW+0u)t6CXkV1kW&Qo~Td)4$-K5Sm#OolbnSQY#xua?x3S@yw
+zHb+c1q3!-l<*xLXr*x)d(4r5M1??F?%6Oy=r9CQ17RbV$r>o@AxgOOp0}Fb~F}mzE
+usnG(YoLoIBF`?o>NX}bOe#wK-5$Io7$K%o_0*3Jb0000<MNUMnLSTaWeVvT}
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_4.png b/assets/packs/Breach/Anims/Teto_128x64/frame_4.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..3ec4092428cd39544ee0ad7b5785c1fc28b700d1
+GIT binary patch
+literal 785
+zcmV+s1Md8ZP)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008mNkl<Zc$__x
+zL1-Lh9L0a%x6_@8rrpsBwy?5Ol0z&WqIhT}bO$X2y`-M>W(0fk(0Y&}t?XwFy$HHD
+z3l>}tiiltpd(eZOUPKx(Ie1i@mPli}G?VN~Hrv^G9%k3;<Ne=zAMbrglJt!vY0#1=
+zfh9@G@FfcX;SB?is}Ch0E!U&Hx8s}Om5kd_;%^<iUfW@;@zTNc@TcPZ|DusUI0=<c
+zCP40);t|m5#3j$w8hxa!G?29IXf7rdJ(!%_@r&AbzKRbfz;7?SwwBFEl?iagUv2i^
+z+RbOAGFV=(C%RgFF`7j0q&bGbd_Q(6j@5c9R;1oogGZPCkv#QYFN58x$ApfYYE+&y
+z21l0qDqQR5eUgQ}baRCuG4bG;94y@Hes+<f1D^*WSorEzdluG-HdqD=E00CsWn`W?
+z1s0t+l6W~!aX7EXfbyiav$m?!>Q}amWFg*2=PCA6c<l@<dGl98&cp1ETmY7Rvo2!Y
+znqT}2d<-Zrnt$t>PE<3RX-gKHV6psr?Q4QLu$brh5wGYz4c`vI19SbJu$}%z0t*&C
+z>~&~4($O*nSU9!%4mRcF-GQHih0T?ae7RwZFLW6!{E%c27sb17>JlJTuv+-*@@Yq{
+zU%sURx8Jl!!-eDySa|X{azpQ|?EExXSiA%`*0vcMGY1xae-5Y~qMEYp@F1e~$Nt{g
+zSK<9p3k!!v%{ThPW4L(a%A#_vP?OG_SwB!#xlx&$ZX-vnJD$U{b(>-c!?HQjcI7<>
+zz)U&q<M+b_00uWp#xTr0_BhAX>{uh{z)%UbJy!zx+<-qx!IX@^i!ZQlMvVWCMm<eQ
+zGA;eokOeB!JQ1@C94Hw`i&ED}S;=_Wkw8~&qVbA!PP&ReVSEVz?Rf&S$<}f7Q$kWe
+z%KR;<@S&lkAq##N?hhY8q!>IH2Ge+h0^%WHK|Tlw*(AckLpXLYKuXGg^2DSOdBap!
+P00000NkvXXu0mjfz-x5w
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_40.png b/assets/packs/Breach/Anims/Teto_128x64/frame_40.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..c9aa12760699ba11fc892097ae6823324204ae60
+GIT binary patch
+literal 795
+zcmV+$1LXXPP)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008wNkl<Zc${^U
+z&1+m`6o;Spof~Ib@^NE}#uB}Q3qL?;cPV}_ce;?`!iax>1lNMPYALaE;|B&5lrBnE
+zPM3lkL9|h%bB!NWDWnogBbCl1EewUkOw4q0XXf7fb8#~P1HQ|La~{si`5hzv`z-$h
+z3I{-Pb^uJ~*cmxc(Ld<8-8I0R-3RWq;Ue3$z7LWlt-858`Xn0jv{$jcve`{q-1BiV
+zu=vZ@)6YJUpWAOCly^B`tfma4_)}LysMPix=?}r`GwW4(gGqbKyM+gj4Hr5~ekSex
+zIh`}_j7DNl+8pZrmO4^AaNIds`Nk~3{a`TqvG)TAxRCv2&Ae0;oIoFg1(j6vE!+rs
+z%Ll2Y&z{~%EBf)cl9DXk<W(O7#--c9!b-)x*XB!ZuW|}3y7Bs?0hgBxeC~tNmWjV=
+zs;Vd#QI{okAM@L=0ZAbTC?4xa&899ZcET}F7PIA;1(z86y#FRxi~(9a5NOFe7l2Y}
+zM@?PXjo)i;S7k9}ppBWgSH2hp3t`Xzc$|8mA{J_uae(zoqnHFZz;>~3Yd^oSb>vL0
+z0a7(ORC!d@o&2iTs>(uh9`Jp`(Y5hQAQ?<DS*o{&I#7{C9}qy13#pBa4@#HvbDF5t
+zbLF^{dO~S8Ig~s!{a0@0Y~Ffu;QU0vMsaw2e(Jjy${>}}N7C0`{Ag?gRF{PyJ&n2M
+zv~GD<;~6aYxgzd|kOZt`35v(l^TRjwQ#E{BvcTQR^q<~oe#g0(?bc=SQ}Zip*GIw(
+z{K3i5i3vfzoW<ce7R(H0hBVqs(B{dUq~$a9b;$v^Sbj1)qRGq=eVaQ0fk$gOYuTMm
+zrxa;J&2BcwkmVFxJjM9oOCTw%%torF1+_|^9N=MQ^L_}B41z1wq#?Bmo{;MKT3=G<
+zh&rw(3v0cGa~C>)lUxU+t+uCIQjEF{PZsWvG)Uol3MzsH_b|k~yGS7)?%(Yu_7&>_
+Z{0jjBjB0BR-?9Jz002ovPDHLkV1mXndZYjV
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_41.png b/assets/packs/Breach/Anims/Teto_128x64/frame_41.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..7e7d86ffac81c9a8e6f1d7c90cb5c6a6e69aeee9
+GIT binary patch
+literal 807
+zcmV+?1K9kDP)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008+Nkl<Zc${6+
+zPiS0K6vy%Jz4Pq6{2_Ujpi_v>h{0wdWKhsZ)p=qoUATz2(4E=1aUlT(11fn{vFchY
+zN`q5S;?hb%r6u!HQBx5TRBFMHOeHk|gPkNz@@D$x{#;C67oOz@?%^KJ`5{SCLs?k>
+z*deQZ*!@2w_`nH!3s&cvAy;ed2(JU_SpGO8>&s+t*RyxO)Gnt3w_tnYqjz`ez1|yH
+zkH;T4HFs{>3}#IwZH|3%G*{2S)%kdIsF=nXw9ia7H?$IrX3#3<zdeR&Y-Mm`EZOkx
+zgP$^3E8HB-JqWjFFncIJz<A8l86+j({<vN4e4)<pOe+2LLh2+7syH)COtq9tB9IcL
+z&s=j;x-_C+DzdPUu9}O~c^!QY7Jl_gXE1e6cRdkAc<A!x;5l4_U}3YT7F&4#;1bw%
+zlBVAa7U%cP#f||6-eUwT^ly|4&<hE(fZ9$?UDJ6rDW0v!Vhl~d;=R4}(EcojzhzM9
+z6~JPS0RiS!H(esc!Uett2y)f&y(&mEZdHHk?1G}f^fOr~m@lFVFAoQW+z(ZdR+26q
+zs?{3(^P!!R2Q#e}LlYDC>|Ti(#|W!~|33C)Y4g<2-1&SJxs#mGqgt_Mwl6Kp!jXJL
+z8q2Gl-vT^%c-M26>(gbviEIecYs<zh_kWtd0;<Wvm!&e%i?>a>V(ny%2caur?j`y$
+z@?SZCg=%wx;H?JG?Cy-;6*{y16{g{N9k>`ktInlT`@0Yel+wb7U5nJ?eAt1j8tpCz
+znw&puI(K^H&F2n>7(&-JAj$PK`X#MR{j;AJw{8{z$aNM))As|K_~gFdUxT#?H+h7f
+zJ38PqA8=Z$Sig=1j@qFXV<y3Eg&^sv=GujdWRy~r1-hfcZxJ%s<KV%Ky#q{ub1?h|
+zbmF@wEg^ND)YF(41{vPZt?3Q<op%z}83zk}0i?J^8&CzLo$WncS3dHJq9~+>*^?3r
+l6-QAX`0}~_fx{15z<<z#aCc$(fztp0002ovPDHLkV1fgXg5>}J
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_42.png b/assets/packs/Breach/Anims/Teto_128x64/frame_42.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..d78a42bfc581b3af2582b1f1ec46c1b47314903e
+GIT binary patch
+literal 808
+zcmV+@1K0eCP)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008-Nkl<Zc$__x
+zUuaup7{-6+JIRui%$+j)b0JA!1v>;6@uo0oA{#2+^u~+b8H=!77IEm9nj;J?>?R1}
+zkb%=NcIiM7!PR6_R;AbuS8&B)lXemu*^;%X%}I04<HbqxUjBHV=l%G2UL;BSQ^PR;
+zP-8d)(DmcsS!M*PzZ`Zsr`-{tu<rQRxIY5Vf77|Qvy`8JNC;xL9wfI<y*Ukp%WOM2
+z?O=`8`hmYvpCdI=bU$KxaYozzP_bvK^`}3xlB+|-<{_=D+0s{12$t>E$^Jp<_YpYQ
+z_$xTAVE-`V=3C7P>j$<bhZ*sI_M~#<(N1UyIDF;bl3tcP$r4<@=0E&&AD^sUTzdus
+zD$T9U+f{lf4oIHfyS>tv^0|g9AuaA!FE8~<s^$7dGO!wZ38Gc_H4+DdRyU?@05~3#
+zfP${=%`E8+d1L$`p+2e8t(H!z<Hlws)VFuHbwzJ$E9&2r3|2obAXbc-jVUk)YGkm_
+z+h+=Z!N52UKOg5O0vDwB)zEEKOb>ZEA)(9qQ7^17Wb7L`Mc@(>?$Mwb`+Dx-Yu|!Y
+zX(fWAs<hKptcna|5($*2+pMwQ#lWSwg~``0?45XV1CYQ9ru6qdyJ45pGRVfYy48S%
+z^KKyn(rnDqbDy7hr;4qTkUsFogVf9y2kxYfbtD7d*W0*{N82r{9|Z$<Q%?W-kv0qN
+z@ntY@l`qehKh9wA^I_?1$33+@Pn1_Y7Xx|!)en=sBHZ!@O}>|Ss+=frm!v)DsmVT;
+zMf34Py%5wRlU5#!xSk06;V*8Ulhi2fEK3m}$nZMgV4fXhI1YFm!5RxeH&Sl1Cx=)h
+z1aXR8E^r5VE=cmUa!l(QD+Q!wfMO^6o15W3tbrw(WcDJm;Jff0b0r;+nwI2-77L2d
+zluKcBQSVAuiK&(z9`Y1tv&5-^fw}`(sNn!0wVrHAK@4(o(?WW*+0uiqfm}dZ5l||i
+mV+WAm3ct_@#@hg0GW-uyZ^H11hwR?~0000<MNUMnLSTY1CWDCp
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_43.png b/assets/packs/Breach/Anims/Teto_128x64/frame_43.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..47750b7ee51979456b5b237a548b061385e47f03
+GIT binary patch
+literal 816
+zcmV-01JC@4P)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008_Nkl<Zc$`I&
+zO>9(U7=@qjySMGoHtj`>ZK8ChY84kI6&7G@+8djo3uAR<H-@^>mFTKbYv)3YnS~||
+zi3x^H7bX%mpc_s7>9CNWR8xb75CnRGCR0M8GgR%Ja{C<@cLul5dvea3_dQ6GbW)NO
+z7bOb-vjDY%4-F8UHqfKHfF#K+74rE+`bBDh@RQa`WoCMt<O5*3kNtJwse{+IAOl>@
+zzp?)%%;ly>+G^Yg41XjU0o2>w(#h=;q<%wDJIwIebDnNDQz~uh{<cMKp$X26{;`<s
+zksfWvUi>rpJ1tZ1{eSf<Vf(vL5;kLZRVv!*FRpJiJlr#j7vw&Z)*FD=$L>p=^Li`0
+z$Mq?Li}1^7A@j&z`g$>yD;-#Dku22Xqd?j0qdx~0Zl~Lc>@0=(;9;<E;^xugX&S=~
+zLa^}FL*w925cGKwAa}s4jV-t_-D2nGlEw9R9GbyALPz)I5}?$q-_wFVT)WpYvL#vE
+zbf>|`3))mp!Q#C~l@jKhHx+#c$VnA_p<zFzxLj=h_Hq9CVVcqaSj>ye;Z3hTJ78+<
+z5lEgpKmEe|e4H=SDp~l^gpp>6)0o{67Iyx$4NE++dtcjeKw1osxFKC@eZu)+Q5L=_
+zzfX$e&B&VrBm9rOsl8vGzuFPC-RS^n)U)b)^+@-rp|i&%3(wC5ijuUtWWRp}EbM)5
+zjnlswHqD`3VBty-z?oibOfABPf-4j3*)i^igS8?SUfb%9YWD{Ts2$F}-%{u+=T7l^
+zFy5Jg8$E-oGiWN%Y6gO8!N$l>dea6dZ+sA8$!(5i#jW4vWdOQPWC|Muu*D?i$qXd9
+z8Q9RTwACXlkW1f5NVx<wTIe%G)$jn=<zPPr{)L}svB1s87zmMpuB>CB^tQBWq-tIk
+zFcC4VDuPTgDNRZVPd61M$WdBhh3bRyM{LFf#Nb1%XC*+NDjOkf>{!#C#KMRpFCXgH
+uy6_VRp#yx#<%EEMWeQlZL{u?A75EQw$f0m%hcspY0000<MNUMnLSTZA&WW`E
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_44.png b/assets/packs/Breach/Anims/Teto_128x64/frame_44.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..403796b1bb40bbb90443e96446bddadaac649737
+GIT binary patch
+literal 823
+zcmV-71IYY|P)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J00091Nkl<Zc$__x
+zO=w(Y6o#Mgn`>s0#@vY&6K$IrD241C5ix3XZV^nRLL+rqFe^pyr<z3+OXsF4bRjjk
+zaU-Nq!KDg<Kh$Jwg|t{qS8WWTnZ#gHiJhCDIydRe_qw>5ZXeF`o^v=HBuRQzlA_#a
+zk_UiT?~2t`y9G#++yYTCYTUgf?Sd~ue`dOPYEM()(D{+CUMer%xu@JLRq9}B_muYZ
+z{3+-eZGzY{QwNHw)tVV`oyqr%(dE9~jKBOS_nI&FMN|1>U}_?IU3#*qOb*_-wH>lu
+zXtw?F(IeVgQhBAR^d70oy{M0>yTBD@R@7)M>6<2a`RJzH!*Z7-3t&5k!0ahE0<gg1
+z`=8Jfx;4&ck}kQ~uP5r#ndhS}$wFiHjlnpEzGt$-V4>y($7u`6pC%6$=GMo(hywJb
+zlSv<n-<_FuH?%>nOG56QvCWC2uBx?E?QsdYxMO4Cca3VfqqHemT;^Ys$9aLTa2YJ5
+zy)8Uz&-^z+8(2~?u!;%xhOC0c<pIaxzJQ@YKu%iG4?F(6OngYPaGam<yuxx&%B+Hi
+z`CGlEUw%8c7zgx%g|{0Q!v<k_x!`{aNOKn+aQ(X3KJa}964FfNbN7_y?>ElBBYCj?
+zSn93DwV(3Gtlt72{2Hd1J^92^{=*0RFXKV^A}2fRFUZ*w0U%vCu-8rOn^wnj`*V^9
+zy0VY*cWHc<4OqC^4cWPVws{snny&xp-b@`-&jR;J7P?J3yVX9gK2CHehjQj0e7Wn@
+zsbnyg9%<Wu5M{FUtu~NUNk?ZT-PZMyq@uExISfGSE6MduhCCt+%|HU4_O52w&?G$@
+z34m-JF%Klbk{#z;6GKag2gLPEg8+m1pn?Tj+p@QVynxPfqI}GiVE~4jp)ib7m^`F(
+zOiD|$jH;581w4qL+l)6WYLYZo!B-`hyhogY(;`a+km8h7t*4==FejwDW71Y^q3FoT
+zLSr4g*g>$9?Bbmb*$E9<R>@<*P^KDLqVOC6{{!{&+A~$aKW6{{002ovPDHLkV1nef
+BlsNzZ
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_45.png b/assets/packs/Breach/Anims/Teto_128x64/frame_45.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..0cad3d63a8fa45a8304075082f6477157e0791f2
+GIT binary patch
+literal 817
+zcmV-11J3-3P)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008`Nkl<Zc$__w
+zO=w(Y7=@pE=aLzlNoR~d9ZPktM$k<$E|kPddRyIPkqBM5OT~rD20=(boC#?Wb)guf
+z6{Ja5cA@A-DpZ=AMvUOkG$0h((o9pGxfMz7B*ht%Z@%N=&Sd*=&ij7vcMg&yO_-dN
+zRz-3F5NB5TZ%PF~l4QT2SX`dpd|&E-nL|DGb2)RMYoYJW%O~owcXH42$Dttu=}TRU
+z$)@ZP-%+y*Vvn2i^D5T6pz877N=~*Sc>vUUWB;iDCx~$b@Z06V=%xJyJ%5d4?XMT3
+z>VRP<=&l_a9hE(<nQuBX)GFV?S)qrH!oD_Emwl|Hv5sQr$-}+yT-gpK3PbJeuG;?M
+zW;!|UuhtT_Oso&`-~uDV0lR@ac`V}tlF`!W+507ha9whtX#$UZAwH=XT)4412)s@|
+z*$|M<$BoLGt>|aApOIWxoonPLImgq*uR=g}Dz~m*^!8#cr@G`~GqD4tgT5^?fJ|C-
+zUDrtZ-mG2jd|_SR>B<qq*qnsgMb&l5rmtA01|%1!3Zy6;JeJNx;Nq0IT6UZ;il@ti
+z;KFJ7nkhpRIu`+HvFX~EOTTBc-{(>i(hbwEVQpknws%HC+FY2^i=`hAQ_gKmNL8Hn
+z{<nfka5DF$<iUk-i3fjJ{yhKC-!(wGFzcx3+|?7)Ix4yF_zns_`Vf<Hk|=L(JYY`!
+zo7Tv?;VY5{{|vCMflsAiya|qo9(kv4{p&5=UO#>y!h-_&GY4ISuT~Oei>>TY?Vi^}
+zk_(ZuuRp*8|C5el*yJSL)?%mp(X0H4Xt6S$C~CSVwRA#Ja=wi2NOk+LT6^G)wm!D(
+z0UO^9wI)~Qg$|f*{#2A)*~XeYV9U#_E+F91Le&MXUBv`!I5?jr9UBa3LEHwDfCd1!
+zc$O%6*tXQr>?Ao=i*kW1^uRcINGt|2oDMyxf(Pv$OUv0U<11;QG1AT?WJ-pjTyVWI
+vF3{qBX9gkWTZcSVe2{EdR7?tA3ry&L=%@pQ#*S#n00000NkvXXu0mjfWrvLG
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_46.png b/assets/packs/Breach/Anims/Teto_128x64/frame_46.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..99a98773da1c2ea8f593c8b8266d02b2fa4343e3
+GIT binary patch
+literal 806
+zcmV+>1KIqEP)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008*Nkl<Zc$_tp
+z&5Ij#9L7KM%WRYF#?JVLRhDMFXnPO~rP>uuf>nBGAr`@#-Cz$rw%#g;$yyIv5O)8A
+zmV&g3r8#)0(3e??L|h?zQ&8F2ZD}f&O*R|ZSv&K4JWO(Z_<kOq?;DaN-B??bEong_
+z6HZaC^gB8|7VMu*uidU_Suz07z5B!WahO)Y&4j6$>tDOY;UUP7q?k|M0`Ir6N9^*X
+zRFSsF9&y5j)`yjVG1B#H>60m`EoG+N!!ym36WE`RkRf-DUW;~`IG4xB-dC5EoK}2x
+zjQCggl6%O->Zrm7oo#8d(e90MBqwVF*=eaW%HcYTlQ@OY#u?H-e}8qSk^1W8Gh|`q
+z>cUW(KN{yH1A4p&1vv6{;UFOGtj_g1wxSS@Nl4v|r;jiHcS)CnTvtNs-2Ajwv#T25
+zWkY^*X|r}*XY?q)^}6K3vG@OKt>E{Q7fw{cp!FG#0JHeaKVcP6;%K0@ZnrlXMc;>m
+zk5kTHPz)%Qw)BTCRfg1ZlEDcX!jp3!f5(9UkQ(|%KiX3Gnqf*pdRc3YcN)F0+~kmi
+zG^dN2p1r}d_1w0Ev}&g`t&QTIzL&M{58kl0IdJ~n#Vs(f>4zqL6xP$1{DWX1szUrL
+zSLz?|IXGe|cgF^US?|T!=CwKo{1fxGb@*MqvXhU%1@G}L1y6O@zz7WV@9qDRhxhOc
+z;XEMSx1W{kdz9Rc@gx^^+cOha98!KF00X;C@LuF&`X~egtQSAp7vK^wI){iaJW1E>
+zt<`L|{b}VSeQQ<8gr&QUimWC@BfF1s*sL;CK;&m0X(N_;)=}hT6($LxHTnY=U@0vh
+zh=Av#EXOtzX#@rvMYzB(>n1Lugo&CHAt^5DZz*wPladS&M*xu^$vpa&2Sm?N;QT0u
+zmDOB?rzk^=!xkpOhYS%6^i}8vL>W?*bkk6%hztp<*xxO2H60;<a}InSjJ~o}lIjk=
+kR;b7TUKN@KpA`cB2dYE!6%k=t6#xJL07*qoM6N<$f_Qv{Z~y=R
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_47.png b/assets/packs/Breach/Anims/Teto_128x64/frame_47.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..e75462600aaaf96aa2f2c7c6fb32ef47162937b1
+GIT binary patch
+literal 819
+zcmV-31I+x1P)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008|Nkl<Zc$__w
+zPiP!v7{-6!>@+jcgp9pJq;a=Uv=(hERBUMN&OyYJDR}V^Ns0w;cD)tB?o<y-5gPE~
+zp_pi?dJN_gDQPwaOrdH-50P4$Z~fD>NZr|uZf29+c|6Q+-{X(xectDV#|VH=?lt?%
+zd+k&SBuV-r9J&~<YE$Zh$?5n1SS}{j2Vm@lxHT>9>VfoNZu}fD(gW>2qY+@I2NH*O
+zSEr?8Jy7o>|HgH^2a1iHF2+wvmn8>)^%t@2?_nR^U>^<Flx|91PZ6A)hqt26;htju
+zMnk%y%9`W?$oQZ)A9D-f066={Jq#RAGEhHmA{VwRoCOzHyR?(2QhaCq?w-uFIQiv`
+zbV8MKJ14o2UR&OvZNa)ZaG=?G4P1-;j3a>b!~C<g8yZu5lr0JAQnfx->zq*wZ$)z8
+z<0mGWcYJdB#z{bFY2+7O(bd)FL;2?=l(O}+{?dXrjn*UwhJ3g~)on)n+Woeno4P&t
+z?~2AG2hCtGJoWX3(U*^agRvMK{Ac#^+zcRH)@i-2nmrWpu;jqObcCfSv3^JZE<9fU
+zFii<gZxt8^7n1&v4z1r!Q1$^SHl{pWjEBvg{uRlEc%m8wu6^aV1APPFfISrwq}=3i
+zvJV^xUh<>a(a(#w=Dy3K*LEnM`Fk*Zx}>7yfc~WHKQb2um<l+M%b#8PX7}Pb!+8K{
+zYujEccxo+_{2>XcA+{OP*1`^X38@nf+#XnzMz1F8SwCizZ*vuRFZD7HCE=%@q+^}8
+zr?b*kKPWCM)m$enW}rE-SXH7|Q<Qo1hha)hu{lq-LEN`9UvV9USz!omG(&e>pi$%$
+z1zd97mDPG-yMhwNBMXw!u@f!npPcN8ypR-o`cJxLwAs$f0pg<=*rUj8gAr^FnC1od
+z{*-6?4_OBoG?7zDOZdCvUa+WT9ZS$>vu_v6s{iQW7FEeim%wlA;G!^F31`?9q!4a*
+xlRgSefzRD8@MbYV4x*Ssb|r!m1pGvS{{cng;uw5R#U}s&002ovPDHLkV1kP`h35bO
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_48.png b/assets/packs/Breach/Anims/Teto_128x64/frame_48.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..2d30abd34783b24195fcf05c4b18a27af517c58c
+GIT binary patch
+literal 823
+zcmV-71IYY|P)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J00091Nkl<Zc$__x
+zL1-KW7=^!?opdIO&Q?njOxRsfXnSh(AVQ<N7KMTb>&1fz8??1INlyi9-3bj?5KIsc
+z9*Pz%cuc8>P$KSx2CN8XV{U@YEYWO2l$~v&yW5?a=V5kx{rKN|KR@qBlB8c2#;dv#
+zxe_T@DA+$mMb#gIoAdQ<eN7XR1pw{&-9v9qvI^-$k}-ZPl8;Qu1RzPY@`hKpCLonW
+z;2+zmk7Ndt))l$m|5=GH4^p<C`Lxk_Qi=y2TRZR6qW9qdQs6k*(~p22f?v-@7)uy8
+z2Bt^Obu0R!8jSZnR*swkZk2*F=|m@Y{Crf^p|Y0K*gJn;XhcdrFKZ)}yuDiY6VG@d
+z&;pncuV<ew4f%Z3eJ%$``xl+>8gWs9+ZmEfI5;<%U>3->91BdiW!*G=vM|Q;fV7yo
+z-Dqe@T{1n%grA=(eF+x5&n}$?6J7lszzmbw;j4fWSNr-__tdl1lTgytzV=kkbY`_D
+zA(geSf3#^wuc$2{RrQ<xsMwny8u59_gmu30@tnuDbn0C|T94<HE4G7CZ}PBYL9TVV
+z2f?mW@`k_y$8hlK&z>0GW&}*=4tI$Ce`&w20FZ)$p-+};BeOyAPI|FYRnEQZZe`;x
+zfV5+Kn!g(s&*1hXq^3Nb*vnQYX7U#$r0q&pM|bCvsS8?@On9_%jO<3)L+%V9wI57>
+zHE9>)A7(sBCRjt)3Gfqx+i6OKb>DKOmoCvSF4q0Wi_*!SpHIQHS3_IU$z^S(oBnkz
+zjDSL^6{NL%%Uko1F_yIHH)v@sR7dYcQ<Z)#7n`BmNRBF_K4`WZ`Z^g+>^^ACw_R;U
+zqX~WByC3AGjw{mDdHKa!AtVDI6M&@9PNtgLwl$@^OrRDSD+~M=@mic#yEsPdQ;5k$
+zDQKPbjOo<~r_dR6U7hA^h^rvq{}*_|teIIzB`Y5G_?&MR2vSh+;YQDkz)wAzc_kq@
+zm59_M4k3gN2mO1r7o}-~tZEcx0uKsMG6|_s;(rvU5R6ewrY`^h002ovPDHLkV1m<u
+BevAMB
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_49.png b/assets/packs/Breach/Anims/Teto_128x64/frame_49.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..e2ef87da0be20c44f612221bf89cb349e10accdc
+GIT binary patch
+literal 817
+zcmV-11J3-3P)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008`Nkl<Zc$__x
+zU1%I-6o#K~X6$Uk!Vb1VuuFC#D&#6H_99}MUA(cE3W7f%h8XCjfr72AcDG&#{y;%5
+zC3X?P+lqpU$c`9jl!`w^TQ4+|A5B|qGMm+AHZ%ENFJ|L+`Ebs2&UX$6Ns`tU57m{^
+zlqkTJz`v~X*8Lw`e{8v**WJ9i2j2VP^to<iPS^K<Y5iIom*S2b03<$o@d;x_BMM*}
+zeDK>Wj6jjn|2nUH+>_Ru@&MRLu3k6E?NPfIv3l3`Cw9MdM+51qmra_7V1<EnVayMh
+zju_elZ#ICbhz|>grFt#zXyy6j-omkBtAW#?P3hSp;=<cwCu~#S)U_))pk%Gl0$xo>
+zz=3S)$(!gB?b5Cb4%|L++~6bxH{2gvAT6d7y>-2%1dtrqexv;<R7nH&fdenU-X@^T
+z!8r~VvpL(>RehnnWpW8wUpJdunpfs)R6<tjYgK=!zt8_uaxl|43}I&6GZQH|FilEC
+zc;9Og!+`X;-sybb+`nW;l}SiHX{~cb{^l`ES8`w^Z8v_7QnTEedKZw^^9S_)__eqe
+zQIZ@eFRa4j;icp+b^s{}(R@8~AMD0u$%7<{vFR^7x2Y~Tki4*<e`dl*c7ta;@IZNP
+z7;k^OHGeAxqzwfc|8A~c4*g=tJ#voMs?pHX!#Ox`w`PeB9BtlDxB(7$qd})X)H&B;
+zVFElbzn6Am)7W)6RtF?YdCRLvUu9JlyDcBy7&;6@vthB@BwzC-J^W={kvyR1kpqu5
+zOaLBm$WD#`H^`y_n14@=k$E_`;;?X>T1qNC>)WaN;2JJ(XS$F-Wl;fQKkI2Jt>pfo
+zk2vHgA%iC=_dlyhcPjS$ASF4Vn)J7ycXhFFoYd3_rLH||Yef}Tc}=OYZeEiEbSGhP
+z5xw+EzIPr<aTDV!sSOSYuQrpIVUpr6%NJYjVpSI6!Ffb*kJs`-qQbFVlTwFL(^6DX
+vf>KM$)}ZxlQ%VehV(M~$-4Ny+AO`*eVORL5jq@bz00000NkvXXu0mjfm?wOe
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_5.png b/assets/packs/Breach/Anims/Teto_128x64/frame_5.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..755c8fae226cbdb23857029fb7178f04b06b834a
+GIT binary patch
+literal 831
+zcmV-F1Hk-=P)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J00099Nkl<Zc$__x
+zO=w(Y6o#Mgo14tE9WysH*b!rAG*P-Rm<ojmr87k#g@RqU=|bqlP2JT+KqZSzMs16t
+z%`PC)WTl%@1s6t;W;8<3KohapKtpGWp;d{=G(YW~%$@IbacA5eUe0;W;hgs%Nzyq<
+zs+~_s9suHAU#LUr6+n{YD!h}c1>=iSOZcK_t}MwNkSqZ7PtV<2=BH6;3F)5fu@Q4J
+z-DZS|c=$S8z1?O6o_X|4M!MZ*1fec%jaahnl0UnuxwqnSm)a#a<8xPP=a&?hi~v4u
+z_(M-M)(1|{w%R6Vh6a=4>7Vm$#?bJB+yQ;C*<!fCr3cc!aedtuj-L5lE}{GLtvRfj
+zbeMpH<%m&z@A;{})kHUA(SmZn4Qw666#sh82Mf(Y?M=Ysr~H0E+SbJBDR)j~cpzC=
+z{dbatt5QwIs$k(&ui#;4czNfQJRmnbu|0jpZK@hu>XR%S{Y-@BGG5}FTYy5wwzSwB
+z%WWt1Sh9ri4-KKUlN+O415~eTSKsMGylTgPku2T|)IjFNvu^nmAa^78mA>6et<Dm3
+zNES+1UG5lM8!aXP5A$Pl5h(Cao)9ctZ+wp_mdiV}RJ4z)z1AJq-DGFbRf{Hl%_l6o
+z`d){50z7y)V~z8#9eE>`auy>>Dm9)RIF{<Z)1N*C(#e=nX85AI-q(_ZG}~)j#SE+K
+zL~lm&pz-U|6h9fpXU%|x<tO>U|NJ-*2ap!RiM_XDeL7shNEXt~Tz`;U)hzj5K&pgh
+zos`@kn{&I8h3wk?L~;-%{N_%}r)R@b9_!QhadhnRc70ybhAIn@#~yVCp)Yfxd*r1W
+z7U=Yr1GaR7!w=hD?@98QyI><>5C1x|rvAUcR-!^4hZ!qifqnb^FY{Re-DQwe9M_>~
+zIU`jw?T@0shN4K)ycCyKym#9fJ+KZd;Uq*|jzE%<PXfRL0updh_(Z0wC!yA)NS5f7
+zjk>fOSjdHBWTE*H!~zHToe1icitH5)J~gr+HOc8-0Z@^Q{sUb<%SSbx(tQ8`002ov
+JPDHLkV1kDPkWK&q
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_50.png b/assets/packs/Breach/Anims/Teto_128x64/frame_50.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..346bdee15aaf2fa9cf157505e038e724b85a336e
+GIT binary patch
+literal 826
+zcmV-A1I7G_P)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J00094Nkl<Zc$_tp
+zL1-Lh7>1vjo$joS?IaL2rib0O2SG%FRH6{G+axG@@G2f8D?Rj5tezApnNfp96to~H
+zBI-e;NAXe+<4&QN6cthyiAC&Anh>nSX3`DGY<Bj4J^Y*7&%^h;d_TM&k|f=`;Mj*;
+z0N9y1RzXe;uzYjGUsJ3|>VrFLX=cjTO!YuX&i(f6+rQ){IZ%kh@)aqal?Q-`b}x4v
+zoLgAM)VcZPI?Np?*;2#5*_71ihjx}8**x~u)I0}!tR3pM_C2Y4FtIi~S2;8S+i^eC
+ztIWf@5%*((Gc~mr^LWCq7OaM)mBTe2NIEkXRKwD%MBGljQ{Y0c{^OAfP^54TT-ci|
+zQPKDOmC^<mnnN?s;|}uTE-%Em@W+X#5~yPi^DQ7%o%Lqhe5ed)$OY%<CyD1gidUi#
+zgAAQqO?{y}A_(O|qu8TNAu=)N!G%*miW3zUH3}}yN5BB5BQ9Ki8C<Bb5AcNZ%v-zQ
+z!75+>_Zlo;|Bhimx?yhX_wa+Q-jH@B7tHpFcr_}PPM;qtf(zv%$7^X^@7x#+b|PHp
+z%&$ZAC;8awgE202;ytL1E$^SCTf>DUiq-vwX>&Jo!G+3Vj2Z4Qxw6s)4@~Ab*(~GX
+z51&q41nKV<3NBspKMx97C=WI!O4Oemy}Nt7Sp=lDpI_IT-G{@03Eysd-|AphN6$t>
+zJTwhR?aVV{o-wy33X2j_&d5G~*t_*pr7U^CNd4dUuSc|;{ERKkcD5c=rG<sKYO8(E
+ziL)4BY{^daI_uMtp6=zo&2aTt8yKbVkDbWh_-r}M=1!W8*?##i?roIY##gmvLF(_d
+z^>O}^s9F#|r*_!Ng8Us>ko(=UQX1qzAEe_~f|k;tS5V6;P0em8^LtlSw#pezN*e{!
+z%`Hd^$^&g;#xo1lP=58j49`!?_8MyBuaG$dNouRT5K+8iQfF`k@BlB4qRf*EiT&JG
+zL&|-qDzX`+1oAGWS}(F0UWzh9#!mkT^FT@*29;3N|BUhM=ztfi`Tzg`07*qoM6N<$
+Eg8jCR{{R30
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_51.png b/assets/packs/Breach/Anims/Teto_128x64/frame_51.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..d0b1415cfdd3769db715e7a5cc11999714fbad54
+GIT binary patch
+literal 827
+zcmV-B1H}A^P)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J00095Nkl<Zc$`I(
+z&rck67{)*Iox$C0p<C-O8o`Cs6b?-VFBK!s#>D8c>4k%-<>1Yzcrhf6>`<cRU~G@Z
+z)GSf|0~4c3(-}4>z0qn798i{4X&WhwT`045_WO9)-TEG%<oP`B;dziGDGk*+0|0vw
+z?Q7~AF}@V}QcKvJ%`7U0|Apb{y3Wh`@|woqzkmD_E8efR8A0@OVMI#&wuR!yOAEkS
+z%cAk>*BhgdZ^x!loWK67q;l)AM)%T<XO9-=A3atJG;EO?VGDY@tA4lPg?iw(EVny@
+zr_GlUHv<eH=km$35yv6dWJL8RPg&_NKY1*a0iD@moPf>PI}8T?z4qHv{XmSn5@F!)
+zi_bHsh+7kQfb`XrIa`yj`_Jg}f{^@b&#9U%D=sK0$U`GX)|VhAdsEpn7?|z3=;3tZ
+z$uN!wnUxOr#<5NS7YyuX8^9e*kyilOP<7RGNex$<zK}|~t9$z6t#l@x4CO(ceSq_h
+z89lPPfPq0mAgDAWJjmEX(Sbw3Rw=$<qoM~d{Zf4Rc7Ja2`oy&{Kw3*W)LUMvy|7Y9
+z%R;I+xzcm~_D=pPPC*8)l#&40OnL(qL2{?(bxGUjOg$!)2d6*fO3%>Z^c&&8c`(qk
+zlV#_@R(7v4J{e%(gf~lMFAse2)71ueu&P1Z_o90*tyBmw(8r)~->iPuTXX{q9CP|A
+z+1Fks+kbew2-0GlvlFhXF5j(7NdE*QmX3yf&p()vJlIDx<r!l?<ajrDfXm?iAq<SI
+zf&uScNFso)1u(#FoNfRipS3#{7c-K6v=5h?U2m+P_(m!X+o`=)`7>dpSWoDO51Iqo
+z%?=&ylMb>x)auv;?P)C?6RiQ=&+jdTN;1}MZEkCP;v^(lU=AeBFUyzy%-E_e2ubmP
+z9hFkoCTT$i$WJ)_9I16)Pan;+o?lD&Xn$O2Pb^uViJeTXT95&q4oF_LvD4iN7;wHN
+zIB@6OoP}zWG2=^V2G3W}WNekC#E>neG-Go`NGu6Ez<-4~{z?+}4&nd+002ovPDHLk
+FV1msli(CKz
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_52.png b/assets/packs/Breach/Anims/Teto_128x64/frame_52.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..b8486473b0224002bae483074a7de4be04d43ea3
+GIT binary patch
+literal 822
+zcmV-61Ihe}P)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J00090Nkl<Zc${66
+z&uiRO6vaR9%{Q5u7Bb@^5Y+G;si5e>6v0hvXOdN*8~*^o;9uZMl&CY)L`#d<*o|EX
+z6X-(0O%zeFka=LCDVR2j*5Z%M*BVVCqnT-9GLxBk$Hn&>7v9Z<%Q@#A-aQw^RZY5x
+zn-7l$761-sII4L5hyI61w@nEd1IeIyB{$7I`O*<(<!RGZsINl>F~WTMz?=R?ru`qH
+za`T<=lte>DF``t=w=3kHTZ|F?nNqkJVS2U1X~(s4AMZ-#dLr6g(`P5VDLR*k?hfgs
+zH`0DFp=@SfZ7ZnjZauO7Tb>cFII^*IW!#H%FhTE;crdqp@dq5Ekv$F;2FtletJcwq
+z%%2Vm|F~yOg@{he4ugg7JM$9@roc}vwimJR-TA5Qz%Oy8qstJW-=~%hHqS`LOmBjG
+zl-l@UQ#EyfhAh4?yHJ8WL57qA4T|b&Q=iK_!kW;ar>=H&O}@m-MOjP$w6N$aO#$-K
+zu0GQ8?SA#3TbIQcA|^0PzVY~QvZw}t9dgNT>$<LAR9h{hUQrfUo20_l6Qu<+7lG91
+zWM3bzH}2=24;O1fnkQQxf2y%J)P$mt43mS0i;Zabj-xD#-ZCYN<7)5nvY7$-d$|jG
+zuzV{uxi_m&$ai~L4WDfui)PdPP!{t>kSX5{-XGg~`%6k#_)rC^E2;4jGnJ}fq2!my
+zp9@_3y^G9XVKKGn*q!DE`>S!JTBH7@;fHjows11e>DriggC<dB?@pX#_t!@7nEcKQ
+zS1-kgbcbVOn26DH@drJ_M%O_uAMC`GgI_0CC9UsVt0wmn-AYSZ*K#k`IQ;wF)2Q+z
+z>ubrqgke=JWwmn<Bf3OqD^iAbK7QpUeCt{qvh+$!xgIu)l7CVa#aVBy|6G=QTJB63
+zJ2eF=+=sr8H8O?NYY_A~aXQ)U4BZNu0b3nFYH^@_-R_WfQ78+?`x%;rPda2y0Rea!
+z>nH4*%?A-!NUd1%-^@E(Nb=!LS^Y24Q1pcQ7jvreE~-*Xh5!Hn07*qoM6N<$f=Ba>
+AvH$=8
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_53.png b/assets/packs/Breach/Anims/Teto_128x64/frame_53.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..cea432554bdc4387decdb985fea369c32f1ed5f6
+GIT binary patch
+literal 793
+zcmV+!1LpjRP)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008uNkl<Zc${^U
+zPiP!v7{-6|?X){clHFJ;Ii${_9x8gsLGT~A6U82SvYs1^A}C%eg5sfcH&&XWo}|!=
+znAH|<LeZjl>5foIz}7^Bx<%<uD(wa_%`6-3Om^mbJnSZ5!1ws$dEfUrJdY#(JBI%O
+z-Y$^8yA7Pdjo#=kMSu4Vn;Kxw?11>n{S~^+egKjrwaSG*G_NIJLq+%3^)%m1rvlso
+zNY<{N+d5U8+gTx$e>SGn)Bsq5XBGp{Hpo`P(u3dBw6G1*R&)M(Pm4Q>ZvA#Qd$}fC
+z9fHni|GIUXN}59-oskn?I1?c$Lm$~I?-?$9&Bs|_fK}&kOCdz*2Vg)|RRRL`NA4S7
+zU@L0>9hf>%TsQ>=mbo{m6Y)@)w1I(Ng7Tkdv_jtE5Eyjpvk|O;J6>=;0NI$$Z*S?W
+z;zB}O23xL%F-q`q&j~R&rHju8#<`Ddo-siARxMRWUui4g9bd>wsXF?umYdS=L(tPX
+zUFu~gl`hEO%m7c|d}J>Ld%?hY8UPQt?G-8*XzB>SS}nRj9i(Q*)r?MV+^GAXz9bi-
+zC-<BPnRJgl%!>{NIv$3pAa9*n9dCdHPCi*}N5y}jDud<;p+aNit;CrH+1tgre4^Pd
+zOkb>8Uk3Iir?KT6|A(b}0O_@bag81R<f*ml_n9xGs&(v*Lm!r|;HWJFb^9iBD{kEP
+zui6L$f%5|80;ryLLtLOA<fFZVK>FNI7+~p9ySeo`mt*%DASqmbmBNM|Irj6SWPk#v
+z$0p0VOmVu70iI^UnZ=3Nn+)=iW{>??2g=UP0~o;jeER4hzefk*w_mzbzya2e4Zhqx
+zZXZ{oztl+wU-lTDWrKr^k2OG2Tsxj=!J^n7)T7ATCYW_Rm|?pOYD)VRd%lpCi_QMJ
+zWcTSVz6^BT$h`)4Vu%1~+4}lT%1|2lGEnJ<B#_~$0tP%&!Sa5BR}2T%6WD+iQwI1K
+XTBfVD)%nh700000NkvXXu0mjfZv%Pu
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_54.png b/assets/packs/Breach/Anims/Teto_128x64/frame_54.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..a8bedda7ff29a0074475129439921642ef6e8485
+GIT binary patch
+literal 814
+zcmV+}1JV46P)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008@Nkl<Zc${66
+zO=w(Y6o#Mg%bm<klb9)rrbV662JJ%Hpn?`c@2o_j*c9BjQ5S+;C}w9Ug}Fs-B2<vB
+zia$*j3NBN#h(eONNec$SKa@70q_+Y4gQ=Nxs<|_{^Sv(a%%*2^;Nd&xJ%{f-MgZ*O
+zXot<x-`oSP-wS+vV95g{Nt%m>1I0m7k(a$lNA)cSYYWf@kIcHKTW{Za_F@Ng^*;XL
+zzfbk&PIj6em|a|&f7L$RQIYiP(PO?@?En{1J@jVLO?G4(r_zDhZB3*VWuShcaxqz#
+zHag%&uKtYcspvun{II7kjY!K<)^u@CH@tz4bX58tBjf<h;Y=lFWG<D~Ur+v#EGTfd
+zhk@x*-Vd?Rj2B;YHst#mE=O4S`NYsVz-Q=7u(0~V5X&Ya?b%%j@z5{F24BI|C|tSK
+zTa7GyygLS4!{73~G8X4Ox)8w;yfZu>fzrGhZ+)dXIoPPkViGt99xVob1mvW;{&EXy
+zy}wfrvgO1YCe~rE4=m;chC$3(H&vpHg-N!+P{_@cwx_Z11ORtmW-LA(f>gcnQDv{D
+zwu9B;QXr%+k{%tZR`2$%U@Nk4YjPLf7#rRyF2)Gk)xQz!D{q~>eDle{7`X{fwMKNc
+z%PbDGibC#s-n53N{>(=e#shh9e`4)g!gHmWD2PFNZ_T*1`##NYfU2_ab*V%+m>d72
+zczz<ngR(n{xlOnd?tiTd3#Ha*ROtQ$(a3`bp~~qu_4Ak-UiP=k{m?wlrIPus43eUE
+z9`FV>_3pt{GUJ-c)#c%W#{Gv(R&uy?t`T9twK7oO+vfrJ_Ja@$?5gp5X4m=5>kZ$D
+zMn0u$wrweA6Lxrs-Ul<_dn*M#*BbaS7Pw@Gnv9zN;7&G}ZEem65=tq`0zaKB{1zgM
+zO#rERMcR~7BR5uTTU*;wiqtMivO8oyC9rU<1ZS8W=O$&aFc5=BbJP}?1`oQ^#6QmI
+s_F*8^%(j$R2-<V_^4T1B_~jJ%ANP8Tx~M}+TmS$707*qoM6N<$f)&n-^8f$<
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_55.png b/assets/packs/Breach/Anims/Teto_128x64/frame_55.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..e5e4c13c6f7c0395392ef281e2715ba3e07045fe
+GIT binary patch
+literal 796
+zcmV+%1LOROP)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008xNkl<Zc$__x
+zPiP!v7>A$vW|C}b*o;<i4^4Nm2l3A#qK7J&UE6>a4~^iVClmDIMWHH)Hj=?g5qb&e
+zp?HV`BJm>jW>IuEjgl6njZkPrB@>f2se(J(NHRN_nV*N*$$NZwf6w<FelL<F-Bd9K
+z00N5Xfe076me~ibg%>@}Yj+<o^>ryt_#4Po{?g)h=a2e1sR!mi3zN3O!~4LtlQAGI
+zo=vlKea)lVDjbo;*wRUDr$wZ5cDcH~fjR|PKcdCoY-z1<*g@MrQh|-a@yo%@)%aa$
+zq}aG}-%zdZ5}jJHQMq+j`lK2DnM*Ssp6^QIQtxAzrzcuA9Gl{IFrdj3u}2GoN?>3w
+zc#<s|Tnf5AAT6C~eRDmYR8WtMWZ=f}6aOYo0L!HzFzCjEj~~Mda660w$`b493qR|m
+z?v#lnL*|V5&LJw?^XBj)fD&8V*XQ+?Vykmoa<CE@t<WEt{_-Fg)B*w)OM7P;37|~c
+z)lD^DO&axNMo81z)W>R?*lj*l7ZUnH-|30f?|JC2x{&5|XXe|qdi&+s%xTI%Wvhl|
+z{P?SjCIO_?=s@=LWOHlSXQ(LypO*$L0~a1RHFDPj$->rA&Gnz%G3B}pe83!$KgKi9
+z|8N=%v<IfhNZw%KxYq#b{q){!uKa0r<?z8B$v~X8q0$$$t;cLIaKY4)h1Wyy#>-&9
+zPkwdWb2UVo_tdqP>280-Pu_D~4+k20_PtWP0u$X{lP?cfW(Pwy=t<#~M)@N0N_LV1
+z`^Spa!iq{dl=mZD`sci)&6(Y6c^$G^@>1UTNApPHy3nPLb)YA8W<%O?8E|?V&TA20
+zvVyuE2FPHV2`dGB46yv4d)2G4gEgK<hKDdd0^aUPJ*<EXxRQfDI0cCfQ~NjfjubMW
+zpjsUAQ9cYQ5rBa;7e*n#1wd-=wxw(U>hh{GV3L4q@g5)#98fvq{wRY+Obr8$U^oN_
+af&T%zS-cp9z}a*F0000<MNUMnLSTXmrF{zk
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_56.png b/assets/packs/Breach/Anims/Teto_128x64/frame_56.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..7a5deaa44c43a249f14c8158a796f95e6846470b
+GIT binary patch
+literal 804
+zcmV+<1Ka$GP)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008(Nkl<Zc$_tp
+zPiP!v7>A$vc9PlZl8lY$YSi68lpYicid3!HXg!Dum7csAP>2UHUId|Oc0`aIN|WA#
+ze*<2k7b_@=5wZcXg5s+65KzomgGr^blijsDvzeWrhp%&ezTfkH@5}prNRsr4Bq^#(
+zSTH9^5uRiKAlh_LMgM?JWZTtRC01uMSF%RK+uc37a7c0iaF(L44*%WU9DoIc>J=s^
+zY~?l5VJEA>)InY&HYDdh(8b?!uy2^U_+3GN<$YWm(w|ozO|_QS`1Zu<W_-Uio-1c>
+zZMM>mvPW{of41yruh3q}l_Ra5G*R#La^<0BTUklEWEDB(z{8=zIje;8r<zG!zLM+H
+zR<=HDrqbf`e+)?ml5o*LgJadhMKI8suNq7PKKJhhq^0+7I(f2RQwWJ<VC~clxU1~@
+zg*`Cn$@4S7%ao(>9YASgq}_a4v+CZs`<{eS4u0AGesH?g_B4<Ts<{(YjQOcI2(E&Q
+zS)*Gj;S|TduI&TLq+NZXDL1Xo@6_#H8qYzpUJozbeGP;27#VK1ci-dAM>hbHqbu3E
+zHo{v1jD)n&JCr?K-)M}79IMN~okIyG<i!VK?;9}C*;$6w%H_}Q83bV9)5%wzl*~C3
+z3>E;Xz?*uox$;_omr6)46dc|4)Z3K{$Mue6;I=z_1qa=5+XT;mfm(Bv%^w~5&KpO-
+zz^@~~P?_P7B)~wGpBe3b3DZk)fB}EdT4?t#u*kl#o6C5YQE6^&YsBvM^4QVRG79jn
+zf&u)=Y9U0a@23`=U+%pgV1N_$;m!>61dvhu*d}iGxtRfHNG2^vi>nbm{lKVg3^#o#
+zCgpd)CSsT4M9u*eEXcb4FjZn$Uj<3iQmLlQk<M0h9e7geNMS_=Z~}l-0lpn>R+_b+
+zG_r{mD6<?<B(k>v0qqc<5M20gY|lq;$sQr~IxYPh8>nSe<U+q#!i_VS?%UQq4+Qw^
+iQN@5EAc`Cy0{#cczt?OlI9+o90000<MNUMnLSTXrsD&&5
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_57.png b/assets/packs/Breach/Anims/Teto_128x64/frame_57.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..d5713769b136365441d0f33eb0afadb6c8605887
+GIT binary patch
+literal 815
+zcmV+~1JL}5P)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008^Nkl<Zc$__x
+zO=w(I7>1vF?k#g0N9XoO5~XG)h_2Ko_(LphGeu*AE-bj}%0U#nPzWewsHGXAkS>Hq
+z+_(@GH!j==F6>5g(}*p!bb=HsGIYjPGo=J`^V7`D<j#3r+?j4)&hvcd@O}qLlHQc0
+zsGO5L0K{5<On<xzNRn)wWGrfR79|4!KUW?<abx`02}lu|^QYdvy14MuedK2O?-<;c
+z)D5zk<SZPW>IJdqY~{z)YW2p(3A2-qqsybDQ(C#k#Ty@quqXX(T<4>Ar2d}c)7e^m
+z`?ivId%+h6tFmt?Z1!&Y&6fqpu;_OkcI3*x((Y-kb`kqVeM9Z6)P0;x?t<7g5GElQ
+z;8uCu&tO-$eJ%|SmMku2a{pc*40NJ%cZoyzJ}7{JRyfq4FQhcXuVA2-pKCx7aF+mS
+zF#e!gwRN>QGAkiF{qgT#ziwA`$8A0<AsaokuGciB<(zgTgALXkD%PuHx2S=E44Yug
+zMC%M$Fmz(zD$db;3#XUC;1#eGbnKA%W%*S=R{BmqDp!*eJs}x5Nn5^#S4O9U1~|ge
+z-G`67To{_#9gbYXz<m5I9g5+d$y{2)+~K|Uux@5ED}Gr*sy05?i>f{7$laDaSQ~NQ
+z>nuGo{F3v40Y}WpJw5dF^XEVNGc!5?(t_*Q{P9=x)frVK13L$R>kg9_A4^xtz48LZ
+z_jBywpFLpU+J3^|ujf!@GytSa$+kV^x*DvrOENIfX$EmN(FIBaY1!6UAt(FC>ioU5
+z+gp$N2ZoU!v_DL%3?`C|5EJoaUy6hqJByP3o339<5yy|8LY&1po+5|5>oMyJ8C>rz
+z|8Rn60O^Ugjpq2l*#a*O*z`M;5Kg&-0o=aenIZzb5CdHPgp(xzN?ink5?1%6ZiNUE
+z;`E0~O=&}l$f%K*0RqS}vxMJ6h=G}qfCeD7_erZs2F6s$3u$Ltx)%du33++Y0o)iU
+tZl(^;uMk%p0wM|+a0pq83{fSd$p2eN#WkaRZ_WS!002ovPDHLkV1m}%f4Kkv
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_58.png b/assets/packs/Breach/Anims/Teto_128x64/frame_58.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..4861f182cd06ee99cb1bee17ab7d9836935e8503
+GIT binary patch
+literal 822
+zcmV-61Ihe}P)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J00090Nkl<Zc$__x
+zO=w(I9L0b4&P!5~X=j)eCn9zx1f(llaAAwpOtnZsAr)M>b0E4C2?)|cWyTQO`b8B%
+zq=Zhvf;&-M7!cdnBGxaQLS0B{Gn0fmiI(Q&!_Ldhd-u3_8Mi;q|J?t*=UgO7dO6BS
+z1MaM30TAze&DL@A5*Pu<9Z~aQI`of&B*}d|GSK?$bd;Ao0N6SC?Cw^@w&^M63v&^q
+zzLgRXrBnBwD4Mw41A#}kR#RcM2bvz^*M{WkJ=4F2g6zr>Oexql{q59uXSZ5%`+6g@
+z`)Z1o6#nlq^4x^n(|UV#+e0HW4`8m*$M$0Gg+@#6!HOofZ`;Yu{R59x-GM|A@p)}S
+zaq;r%K%%%4TKchp-pzsqo;qOZ!qnlTML>$&m5Ev;`Ouauv`s0(mMD_C4i;|R-cLxG
+z9D_a}oeyp_8m_L;bRU;2EPPU!o8nV8_x#`ka#Ihl>(}^=+Wm~akSs2{_%AS6j@LN~
+z7ES|^J$&Z=wEh5#34s7E4&Pq64k)haj=pgNmpX)FlEsv{%0M(S_)O}|GFZ$BIx>BJ
+zxc*i(c_5>o-Jwdu&zH@Tgj8z}xkHuT)4RgVq=fY6$(%c=yXllmEl3{ZU&$+GbM%HC
+z&H+->Gx4LZ`t?#d(~>M)I9X-w$|GOxA6{Gr3!|y3q5FOH%f4MxVBw)zs-^dTA@WQK
+zEEMWRvV-U3`PCWl;O{Y-*~xPhD$jd>)QYw`<(+b~m#TRQX*Kry$tXTQzmdd{?Ur6k
+ze}rT7gJzQ4vUxAp!~>3PhkejxB+ct`J!w!gjyB|UQ>O|ESk#IX>P3ZP35c~IwcKun
+zsiYr<X~!IQlYbzo6D<9thOD-pOh%#;?H|V_E4S8=2W)yfOceopvP}yFSBXm86XwHY
+z)2t5=2%-e6fe*LX%U<w+9K6o-D$5iTMH>3C$H+ngB7hkmXeK>1QaiLT?kLCux{!L)
+zL8+6B*d5j6be4M_K9O&LfFek)Sx`U<bb*Tg15E4g^oa6xeE<Le07*qoM6N<$f@=4U
+A(EtDd
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_6.png b/assets/packs/Breach/Anims/Teto_128x64/frame_6.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..fae24ed76c84da801ea8213292887fc70397884e
+GIT binary patch
+literal 806
+zcmV+>1KIqEP)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008*Nkl<Zc$__x
+zO=ui-7{-6|p9wqY;x0i<1nF!EmYyVdachGas~|$5ITX}`CQ!U;^b|qN&=g9&6g~Jw
+z4~u#g4}umcc4DY0mYVIwQ_4>4M^cE*WE;A(&CLJtFuPtKo)37R=S7mF*}Nv5)p^MP
+zAkOSkT;xqal4LK1qrqxt=d3gUB9GOtf_!W!!JAk<zIoG2{+G0C*>R}6FqGuJd;i6T
+zTl9uN3j5VS!RF8-g;$QIBtDeD-I_MuYC;1X0bKv}Nc;8L_`ehBfYCmeq|fA;7Y<{a
+zm20xcddoi!OqE^DaaR35h79|`+NSK&i#jo2JaXFGuoKy48C&?19Ksoo??okWC37<%
+z(dU%FJIx3;CVJVQ1Or9#*&&DtohSqYJwhM`+!-*ietpuz%<(*K3`pN3>4`PFrVLw=
+z4E*q2cP8Qswu5jEkX;D=>0B#5>^!V#M>1IdBn{708b!D4D6d@J)R%gxk}cU43HAHB
+zqhIvf#2&A?5-MuCqn~W$=LIrXGB`Wo?^KHM(b&D}15!A>VUMa4KNs=1goHh3rxs`9
+zrxJHXLOS0wc53mjYBj5!l8`$2F*UVat=Qm!WT5_i+uCUFVBa*hz`%{U9kQ+DTjr7~
+zco0VpyYcLNeeCqsI0g>7k>SzJ_zCm&JQx`J8il9+BzH|&)Q$VjC+|P3*aK6zk^xg^
+zy?FLhf(Q=`?AfHX*L{y!Lmdnp?zgHfgJ|3utT3Zn4YYqjAHPwSy*2XK=o}un?UIom
+z$!n4>=<-_0XuoQ1BSNmsl#IK&CuKUR%q@qTYeU+!PpZ5r7*1O*(uMM->ZZ41b!3#i
+zTT1Lly}tv=$nJLJ0bS2uZXpK_)DtAd(^`?XU1>d#0U9weq$6;t9NiN5u$~=et4w(y
+z^|drlO-U)Kf`u9CFnl0<&cr|h9uy;%%-N4<P_D4ZrECHG#hgF}952FaLdNZ(M@)`G
+korDHRHl0=qpcaAt14%vIlx?}HzW@LL07*qoM6N<$g0VG#Z~y=R
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_7.png b/assets/packs/Breach/Anims/Teto_128x64/frame_7.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..71d7ee10634293047df55a263902f71d9d0ca7e9
+GIT binary patch
+literal 794
+zcmV+#1LgdQP)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008vNkl<Zc$`g>
+z&ubiI9L7KM?kqb?((KqGl#*uFQ^ixT6zdP1l^iOF#J`|yE41FMQgp?`&LT7wgm{Y}
+zVzqdVcoMPhNWm6F8YybfK&DbmN>+E`YO~p$eIF0ATfBbwKHul%`#dj_B(27u$X2v0
+zk%QCtVPD#t0J{;fbVJ?mAAmTB54Dv|Jpebu^gZD13CNx=WsgB=Wdiyx!=r)hFOmVE
+zpYhHYXM!^c<P%$!EU1_MXZu~Ly}W*2T9O<Ae6({od22Y`eIy-A4j;Rv?5xtoiR9#|
+zEvc+{RdNB;Ujc}`N5?MNYm2vKJ!vB0;O4$WJ6p;@+PJ#1-yHesmhzW=e9};eOk=wY
+z7*OgPi0C)Gc|h9VY@OO1go@!!$-rO1`)=yiNvh6EU|{>HIuY|co*caiNUd*o7hlk;
+zx>v9j$%P*-bt0_CaH>@YWG{q&YfDcz@0Zn;Q0Azo8@jgKbJUd#%tbJb^G5L!382xQ
+zdiqT(Ph6x@kdSR_OTP{(8(-01kPNhI-*CO?-+dh~1|)(znr(LDXCsbFNYUtBJKJ34
+z$eltS!>x_7X7z_V(=RPZNZs_g(UIm_5nH$}8QAq>GwQFs!ok`69&ycSR*ol?T0K0U
+z$Iyzce>zPcK6ZH>4EQfbcK*a!dF2xcxG=TjIn@I{;^PVo%zOr%yT(Hvm%+fGUSs#C
+z&_-qqJR8Na!-xf{U|`zR+{DL#Vlcq(Q$NpCaS8WpxrBeuIWb`PJfHACbS?rNO7$Gv
+zzRK5#y5rQwg=wm()IO<XaZ=oU*rWqvmw&Q2iq=S=noD}mH13BQ7PXfLg(&_RlNq>@
+zfTVa%JCZ%5{#+m=Wr6NV9Y;0`WPmII=m@ghrEgg$S;wQ1yNs;vs+CYt63ES~c>t5(
+z!{kS)XG;(&&X>Ln(}N+P{2qK7VLz}?8{~Sj80P}`Y>#(*8Aw$JUooK!uvddCA|)Z=
+YKbsW$#a0SP=Kufz07*qoM6N<$f;ydhSO5S3
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_8.png b/assets/packs/Breach/Anims/Teto_128x64/frame_8.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..eddaa6ded6c6d0f2993d38ed915af75a63d7bfda
+GIT binary patch
+literal 810
+zcmV+_1J(SAP)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008<Nkl<Zc$__x
+zPiP!v7>A#kon$u9?GCoks7<n^m3j!arC?Ji-4z879^y?8LQ@gE)x?TaDa=S)y$H?C
+zi_(aPdeVrOVyHW%iot>#q@vU|{c2OTDzuY-&184>`+1mMuMh9<_r82QACe?}GEHd9
+zDoZW^lxK@UE8#kH!FP@KuQy=vfAGLN@$4V)0w77U6+e3h7?N_3;cN_n^KY*-L+7T>
+z%P#afHqXRg{I-6eQtNdzeVt$EljeGn<`H8?Pe8FZ@v;At?3CJmZ_CczP1#*xwxb8e
+zns=qAWL}Xx0C9g0x*ab?-3}ff|6AHp*Vp-$<<o~xZ-cd%OZj2HzXoZn$gJ%IBwIC~
+zzhpzjVOEe_XvH%g8DP8skXG&B#cOs%1`bI`Kc)xvUbEv$#@LWt_+dWYlR1M7%=-&~
+zw9lU!zo<i6^5sh&dM=pw3eF~v6{7usELzb$UDj$zc}F>dN8Bm)pJW!0ZR=Ov(4v#R
+zXd4o;p;q;${Q4M$k0cid9Nef_dV}{q1*Dnkl7{rqj6y;3pkhC>PE<VnPh0~$D1Y<h
+zyD(Ym-_1MV!Ju2CP20^%ng<sKf=k$0t5)U!E+iA^)LAANEsTN(=J+nlt)Uw{z1IVz
+zg?_Z}=eNV*H}5qhq=%^!zIC_H9+^^A^1wDx@rk(zIRd0*Tj}iI8fKR#9Z4>DS?na6
+zQ3uZtzy<47GE>Ax{b>&RUiY#s(-gB>8Us@2ukB`QD9yEXEcYV~j`@<l?bI*i;L3;9
+ztFk)SvDF+r8n53`s*@IVmAY_yQBAu|AE>KkrF4AyOHxz=51?Xr8GtAUE7jrWE8yYh
+z4@6_xZOyQe@+t--+49j%=|Mr}=!lS%_*#>0I$F&}<O0blfSbb0a&cE|xE@}e#BV0~
+zM9CqGzn`SIJ?Z_ZNX9h;x%g6DN`CR7syL5ai5OUE1FGebT1;PHq1NhNI&5GX0`7Og
+o`YcZ1KxC+Zq()gXfFefpAB<Y)Y^rNg1poj507*qoM6N<$f||dF7ytkO
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/frame_9.png b/assets/packs/Breach/Anims/Teto_128x64/frame_9.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..c6c168c133247d50907b9e95bf8265e0d1d99453
+GIT binary patch
+literal 800
+zcmV+*1K<3KP)<h;3K|Lk000e1NJLTq004jh002M%00000`mI9J0008#Nkl<Zc$__x
+zPiP!<6vsdF+i7NK{_Iprg*NPtQ2!Lc1Vo4!+zpgAh#-3DQ4hsli+Cusx?3XcO^X+U
+z7Ym9W)r%Hw$wZ=55VCj@tM(U{n$)U0Y1i)T?#z5W%&xb`m+$+2dGCE6k|f<&4XQey
+zmn90|UEJe&O<R%yfQonZxmyu;V8l2)ojkuOMdOzI0q378l|>^t0?1q%<-1KPTetwE
+z5c$67jWzDAq?4c9nlh<i#FyPG4<F0`3fp#graLnS-7#>z)m?UdXpMoHK<w$k@>q2C
+z)UI@C%^n(wuK!i{;fu~guM~`A_Q<JpO&4C)onp96`&ivXq_9(np6NOO$87dC7|5d5
+z5=11dgkYe@a*SgMS$Ydx=-v(v!#u%yeHsjWwBP0s!Yoe!(kG?<_APy>+c<5>!1o7P
+zHI$fazIho8y7W6t(cZ}~o&-={)~?$6P5nI@N(TPK;N!SDS1ibR6)?ndzu^}^n$wT^
+zHS=zK<t%PX2418>-T0Fqs`Ne}t!Epm)Oz*+^?edjM^2;Cc+XbrIFbRs?~~h;kHjCd
+z7Yy`$XxM*A_9_M>8<JmKYaKYBIHh9AOI7@zPrRUGM1Yh`pm(mvwV+-aN=SdFXs-SA
+zTIF=LCmHCqkw0_1Rw>z^z=i4QP(1!^lWg*-2&C@7YTj#P*G?k|X_zy>)9~8sjwAz)
+zaTC|aZB8gCZp+mDnVR&>Fsc@@^!Il?NoT*-&EnYoAEr_usmp>3e78FH5^`+rQUD9{
+zC-yP$g3=qMdJ(BkCoXU2k7{HK1iko59&3WacDH=5tefeBIU~j<X9L1CamGo0cA*u<
+z4B#~^NJ_nYaZ`VIT2xgA*hroA&$vI}XjZg5xj+_SMKvve>?pb2xQb8m{}aaL6-!yR
+zI(}3CZf*(2wp&fSLl+`K?C4)2*cdj80!f_@l*d3Lq0s2Z5CiOthU<MQg${utYBE3?
+eLQ}+8EdK$ga==baZ|t%F0000<MNUMnLSTY06MrNC
+
+literal 0
+HcmV?d00001
+
+diff --git a/assets/packs/Breach/Anims/Teto_128x64/meta.txt b/assets/packs/Breach/Anims/Teto_128x64/meta.txt
+new file mode 100644
+index 0000000..3c8ef2f
+--- /dev/null
++++ b/assets/packs/Breach/Anims/Teto_128x64/meta.txt
+@@ -0,0 +1,14 @@
++Filetype: Flipper Animation
++Version: 1
++
++Width: 128
++Height: 64
++Passive frames: 59
++Active frames: 0
++Frames order: 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58
++Active cycles: 0
++Frame rate: 30
++Duration: 3600
++Active cooldown: 0
++
++Bubble slots: 0
+diff --git a/assets/packs/Breach/Anims/manifest.txt b/assets/packs/Breach/Anims/manifest.txt
+new file mode 100644
+index 0000000..393f1f8
+--- /dev/null
++++ b/assets/packs/Breach/Anims/manifest.txt
+@@ -0,0 +1,9 @@
++Filetype: Flipper Animation Manifest
++Version: 1
++
++Name: Teto_128x64
++Min butthurt: 0
++Max butthurt: 18
++Min level: 1
++Max level: 30
++Weight: 3
+diff --git a/breach/README.md b/breach/README.md
+new file mode 100644
+index 0000000..15dc119
+--- /dev/null
++++ b/breach/README.md
+@@ -0,0 +1,51 @@
++# Breach — прошивка для Flipper Zero
++
++Форк [Momentum](https://github.com/Next-Flip/Momentum-Firmware). Развивается поэтапно,
++чтобы каждый шаг можно было проверить и откатить.
++
++## Этап 1 (готов)
++
++| Что | Где |
++|---|---|
++| Обои главного экрана: анимация 128×64, 30 fps, красноволосая целиком по центру | `assets/packs/Breach/Anims/Teto_128x64` |
++| Пак Breach выбран по умолчанию | `lib/momentum/settings.c` |
++| Скрипт: любое видео, GIF или картинка в обои | `breach/tools/make_wallpaper.py` |
++| Точная инструкция по смене обоев | [`breach/WALLPAPER.md`](WALLPAPER.md) |
++| Превью раскладки главного меню в настройках | `applications/main/momentum_app/scenes/momentum_app_scene_interface_mainmenu_preview.c` |
++
++## Как спланировать главное меню
++
++1. Открой **Settings → Momentum → Interface → Mainmenu**.
++2. В пункте **Menu Style** выбери стиль (Wii, DSi, PS4, Vertical, C64, Compact, MNTM, CoverFlow или List).
++3. Открой **Preview Layout**. На экране схема раскладки именно этого стиля с номерами приложений.
++   Кнопки влево/вверх и вправо/вниз листают приложения, выбранное подсвечено.
++4. Нажми Back и поменяй порядок: **Item** выбирает приложение, **Move Item** двигает его,
++   **Add Item** и **Remove Item** добавляют и убирают приложения.
++5. Снова открой **Preview Layout** и проверь результат. Выбранное в **Item** приложение подсвечено и в превью.
++
++Как заполняются экраны (так показывает и превью):
++
++- **Wii**: 3 столбца по 2 ряда, заполняется сверху вниз, потом следующий столбец.
++- **C64**: 2 столбца по 5 строк, сверху вниз, потом правый столбец.
++- **Compact**: 2 столбца по 8 строк.
++- **Vertical**: одна колонка, Flipper держат вертикально.
++- **DSi, CoverFlow, PS4**: горизонтальная лента, выбранное приложение в центре (в PS4 слева).
++- **List, MNTM**: список, видно три строки, выбранное в середине.
++
++Превью схематичное: показывает порядок и положение приложений, а не точную копию экрана с иконками.
++
++## Статус проверки
++
++В этой среде нельзя скачать тулчейн Flipper, поэтому **полная сборка прошивки не запускалась**.
++Проверено: анимация (кадры и `meta.txt`), синтаксис кода превью на заглушках API, сигнатуры функций
++по заголовкам репозитория. Не проверено: сборка `./fbt`, показ на реальном устройстве,
++скрипт упаковки в `breach/sd_ready` (нужен `pip install pillow numpy heatshrink2`).
++
++Первая сборка: `./fbt` (или `./fbt updater_package`) и прошивка через qFlipper.
++Если сборка выдаст ошибку, пришли её текст целиком, и я исправлю.
++
++## Лицензия и апстрим
++
++Momentum распространяется под своей лицензией, см. `LICENSE` в корне. В репозитории Momentum есть
++`AGENTS.md`: мейнтейнеры запрещают отправлять им правки, написанные с помощью ИИ. Не открывай
++pull request в апстрим Momentum с этими изменениями. Для собственного форка Breach это ограничения не создаёт.
+diff --git a/breach/WALLPAPER.md b/breach/WALLPAPER.md
+new file mode 100644
+index 0000000..7fd5675
+--- /dev/null
++++ b/breach/WALLPAPER.md
+@@ -0,0 +1,64 @@
++# Breach: как поменять обои Flipper
++
++«Обои» главного экрана в Breach — это анимация 128×64 (1 бит) из asset-пака **Breach**.
++Скрипт `breach/tools/make_wallpaper.py` превращает любое видео, GIF или картинку в такую анимацию.
++
++## Один раз: что нужно установить
++
++1. Python 3
++2. ffmpeg (должен запускаться командой `ffmpeg` в терминале)
++3. Библиотеки: `pip install pillow numpy heatshrink2`
++
++## Способ 1. Без пересборки прошивки (быстро)
++
++Все команды запускай из корня репозитория.
++
++1. Положи видео в папку репозитория, например `my.mp4`.
++2. Выполни:
++   ```
++   python3 breach/tools/make_wallpaper.py my.mp4 --name MyWall
++   ```
++   Скрипт сам выберет центральную область нужной пропорции и сделает анимацию на весь экран.
++3. Появится папка `breach/sd_ready/asset_packs/Breach`.
++4. Вставь SD-карту Flipper в компьютер и скопируй эту папку в `asset_packs/Breach` на карте
++   (если там уже есть папка `Breach`, замени её).
++5. Верни карту во Flipper. Открой **Settings → Momentum → Interface → Graphics → Asset Pack**
++   и выбери **Breach**. Перезагрузи Flipper, если картинка не обновилась.
++
++## Способ 2. Вшить обои в прошивку
++
++Пак лежит в `assets/packs/Breach`, и скрипт обновляет именно его. После запуска скрипта
++просто собери прошивку обычным образом, Breach выбран паком по умолчанию.
++
++## Параметры скрипта
++
++| Параметр | Что делает | Пример |
++|---|---|---|
++| `--name` | Имя анимации (только буквы и цифры) | `--name Night` |
++| `--start`, `--end` | Какой кусок видео взять, в секундах | `--start 1 --end 4` |
++| `--fps` | Кадров в секунду, 1–30 (по умолчанию 10) | `--fps 30` |
++| `--crop x,y,w,h` | Какую область кадра взять, в пикселях видео | `--crop 0,80,480,300` |
++| `--delogo x,y,w,h` | Стереть водяной знак в этом прямоугольнике | `--delogo 2,280,70,66` |
++| `--layout` | `fill` растягивает кадр на весь экран, `center` вписывает картинку целиком по центру, `side` ставит её справа, слева надпись | `--layout center` |
++| `--text` | Надпись слева при `--layout side` | `--text "MY FW"` |
++| `--no-glitch` | Выключить глитч надписи | |
++| `--mode` | `toon` (по умолчанию): чёрные контуры и точечный узор для цветных областей; `solid`: чёткие чёрные формы; `lines`: тонкие линии; `fs`: точечная фотография | `--mode solid` |
++| `--threshold` | Порог тёмного: больше значение, больше чёрного (по умолчанию 140 для toon) | `--threshold 120` |
++| `--invert` | Поменять чёрное и белое | |
++| `--keep` | Не удалять другие анимации в паке Breach | |
++
++Обои из этого репозитория (красноволосая из видео) собраны так:
++
++```
++python3 breach/tools/make_wallpaper.py video.mp4 --name Teto --start 0 --end 1.95 \
++    --crop 0,80,480,300 --delogo 2,280,70,66 --layout center --mode lines --fps 30
++```
++
++## Советы
++
++- Экран Flipper очень маленький, лучше всего выглядят контрастные рисунки и аниме-арт.
++- Если картинка слишком чёрная или слишком светлая, меняй `--threshold` (110–190).
++- Про 60 fps: у исходного видео 30 кадров в секунду, поэтому 30 — максимум, который имеет смысл (скрипт выше 30 не берёт). Каждый кадр занимает память Flipper, так что для длинных клипов снижай `--fps` или бери короче кусок: 2 секунды при 30 fps это около 60 кадров.
++- Чтобы найти нужные координаты `--crop`, открой любой кадр в редакторе и посмотри размеры в пикселях.
++  Формат такой: `x, y` — левый верхний угол, `w, h` — ширина и высота. Лучшая пропорция области — 2:1.
++- Если что-то пошло не так, удали `Breach` с SD-карты и выбери в настройках пак `Default`.
+diff --git a/breach/tools/make_wallpaper.py b/breach/tools/make_wallpaper.py
+new file mode 100644
+index 0000000..eca63e4
+--- /dev/null
++++ b/breach/tools/make_wallpaper.py
+@@ -0,0 +1,267 @@
++#!/usr/bin/env python3
++"""Breach wallpaper maker.
++
++Turns ANY video / GIF / image into a Flipper Zero desktop animation (128x64, 1-bit)
++and writes it as an asset-pack animation folder.
++
++Needs: python3, pip install pillow numpy heatshrink2, and ffmpeg in PATH.
++
++Simplest use (whole video, auto center-crop to the Flipper aspect ratio):
++    python3 make_wallpaper.py my_video.mp4 --name MyWall
++
++Typical use (cut a piece, choose crop, remove a watermark, text panel on the left):
++    python3 make_wallpaper.py clip.mp4 --name Teto --start 0 --end 1.95 \
++        --crop 0,80,480,300 --delogo 2,280,70,66 --layout center --mode lines --fps 30
++
++Result goes to  <out>/Anims/<Name>_128x64/  (default out = assets/packs/Breach)
++Then see breach/WALLPAPER.md for how to put it on the Flipper.
++"""
++import argparse
++import os
++import random
++import shutil
++import subprocess
++import sys
++import tempfile
++
++import numpy as np
++from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
++
++W, H = 128, 64
++
++
++def run(cmd):
++    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
++    if r.returncode != 0:
++        sys.exit("ffmpeg failed:\n" + r.stderr)
++    return r
++
++
++def probe_size(src):
++    r = subprocess.run(
++        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
++         "stream=width,height", "-of", "csv=p=0", src],
++        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
++    if r.returncode != 0 or "," not in r.stdout:
++        sys.exit("Cannot read video size. Is the file a video/gif/image?")
++    w, h = r.stdout.strip().split(",")[:2]
++    return int(w), int(h)
++
++
++def auto_crop(w, h):
++    """Largest 2:1 box centered horizontally, vertically a bit above center."""
++    if w / h >= 2:
++        cw, ch = h * 2, h
++        return ((w - cw) // 2, 0, cw, ch)
++    cw, ch = w, w // 2
++    y = int((h - ch) * 0.4)
++    return (0, y, cw, ch)
++
++
++SS = 4  # ffmpeg renders SS times bigger, we shrink it ourselves for sharper 1-bit edges
++
++
++def to_1bit(img, size, threshold, mode):
++    """img is SS times bigger than size. Fixed levels on purpose: auto-contrast would flicker."""
++    if mode == "toon":
++        # dark = black, strongly colored areas (hair, clothes accents) = dot pattern, rest = white
++        a = np.asarray(img.convert("RGB"), dtype=float)
++        lum = 0.299 * a[..., 0] + 0.587 * a[..., 1] + 0.114 * a[..., 2]
++        colored = (a.max(axis=2) - a.min(axis=2) > 70) & (lum < 200)
++        dark = Image.fromarray(((lum < threshold) * 255).astype("uint8")).filter(ImageFilter.MaxFilter(3))
++        v = np.ones_like(lum)
++        v[colored] = 0.6
++        v[np.asarray(dark) > 0] = 0.0
++        small = np.asarray(
++            Image.fromarray((v * 255).astype("uint8")).resize(size, Image.BOX), dtype=float) / 255
++        bayer = np.array([[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]]) / 16
++        w, h = size
++        th = np.tile(bayer, (h // 4 + 1, w // 4 + 1))[:h, :w]
++        return Image.fromarray(((small > th) * 255).astype("uint8")).convert("1")
++    g = img.convert("L")
++    if mode == "solid":
++        # dark areas (hair, outlines) grow slightly so they survive shrinking -> crisp shapes
++        g = g.filter(ImageFilter.MinFilter(3)).resize(size, Image.BOX)
++        return g.point(lambda p: 255 if p >= threshold else 0).convert("1")
++    g = g.resize(size, Image.LANCZOS)
++    if mode == "fs":
++        return g.convert("1", dither=Image.FLOYDSTEINBERG)
++    return g.point(lambda p: 255 if p >= threshold else 0).convert("1")  # lines
++
++
++def side_panel(width, text, frame_idx, glitch):
++    """Left panel with vertical wordmark (+ optional glitch slices)."""
++    panel = Image.new("L", (width, H), 255)
++    if not text:
++        return panel
++    size = 15
++    font = ImageFont.load_default(size=size)
++    tw = int(ImageDraw.Draw(panel).textlength(text, font=font)) + 2
++    txt = Image.new("L", (max(tw, 1), size + 6), 255)
++    ImageDraw.Draw(txt).text((1, 0), text, font=font, fill=0)
++    txt = txt.point(lambda p: 0 if p < 140 else 255).rotate(90, expand=True)
++    x0, y0 = 3, max(0, (H - txt.height) // 2)
++    panel.paste(txt, (x0, y0))
++    d = ImageDraw.Draw(panel)
++    d.line([(width - 4, 4), (width - 4, H - 5)], fill=0)
++    for y in range(6, H - 6, 6):
++        d.point((width - 8, y), fill=0)
++    if glitch:
++        rnd = random.Random(frame_idx * 7919 + 13)
++        if rnd.random() < 0.45:
++            for _ in range(rnd.randint(1, 2)):
++                h = rnd.randint(2, 6)
++                y = rnd.randint(0, H - h)
++                dx = rnd.choice([-3, -2, 2, 3, 4])
++                band = panel.crop((0, y, width - 6, y + h))
++                panel.paste(255, (0, y, width - 6, y + h))
++                panel.paste(band, (dx, y))
++    return panel
++
++
++def make_sd_copy(pack_dir, sd_out):
++    """Compile the pack with the firmware's own asset packer -> folder to copy to the SD card."""
++    import importlib.util
++    here = os.path.dirname(os.path.abspath(__file__))
++    packer = os.path.join(here, "..", "..", "scripts", "asset_packer.py")
++    if not os.path.isfile(packer):
++        print("note: scripts/asset_packer.py not found, skipping SD folder")
++        return
++    try:
++        spec = importlib.util.spec_from_file_location("asset_packer", packer)
++        mod = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(mod)
++    except ImportError as e:
++        print(f"note: SD folder skipped ({e}). Run:  pip install pillow heatshrink2")
++        return
++    import pathlib
++    pack_dir = pathlib.Path(pack_dir).resolve()
++    stage = pathlib.Path(tempfile.mkdtemp(prefix="breach_pack_"))
++    try:
++        shutil.copytree(pack_dir, stage / pack_dir.name)
++        out = pathlib.Path(sd_out).resolve() / "asset_packs"
++        out.mkdir(parents=True, exist_ok=True)
++        mod.pack(stage, out, logger=lambda m: None)
++        print(f"SD card folder ready: {out / pack_dir.name}")
++        print(f"  -> copy it to the SD card as  /ext/asset_packs/{pack_dir.name}")
++    finally:
++        shutil.rmtree(stage, ignore_errors=True)
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("input")
++    ap.add_argument("--name", default="Wallpaper", help="animation name, letters/digits only")
++    ap.add_argument("--out", default=os.path.join("assets", "packs", "Breach"),
++                    help="pack folder (default assets/packs/Breach)")
++    ap.add_argument("--start", type=float, default=0.0, help="start second")
++    ap.add_argument("--end", type=float, default=None, help="end second")
++    ap.add_argument("--fps", type=int, default=10, help="frames per second, 1..30 (default 10)")
++    ap.add_argument("--crop", default=None, help="x,y,w,h in source pixels (default: auto)")
++    ap.add_argument("--delogo", default=None, help="x,y,w,h rectangle to erase (watermark)")
++    ap.add_argument("--threshold", type=int, default=None,
++                    help="0..255, lower = less black (default: 140 toon, 165 solid, 150 lines)")
++    ap.add_argument("--mode", choices=["toon", "solid", "lines", "fs"], default="toon",
++                    help="toon = black outlines + dot pattern for colored areas (default), "
++                         "solid = crisp black shapes, lines = thin line-art, fs = photo-like dots")
++    ap.add_argument("--layout", choices=["fill", "center", "side"], default="fill",
++                    help="fill = stretch crop to the screen (default); "
++                         "center = keep proportions, centered, whole picture visible; "
++                         "side = keep proportions on the right, text panel on the left")
++    ap.add_argument("--text", default="", help="wordmark for --layout side")
++    ap.add_argument("--no-glitch", action="store_true")
++    ap.add_argument("--sd-out", default=os.path.join("breach", "sd_ready"),
++                    help="ready-to-copy SD card folder (default breach/sd_ready)")
++    ap.add_argument("--no-sd", action="store_true", help="do not create the SD card folder")
++    ap.add_argument("--invert", action="store_true")
++    ap.add_argument("--keep", action="store_true",
++                    help="do not delete other animations already in the pack")
++    a = ap.parse_args()
++
++    if not a.name.isalnum():
++        sys.exit("--name: only letters and digits")
++    fps = max(1, min(a.fps, 30))
++    if a.threshold is None:
++        a.threshold = {"toon": 140, "solid": 165, "lines": 150, "fs": 128}[a.mode]
++    sw, sh = probe_size(a.input)
++    cx, cy, cw, ch = (int(v) for v in a.crop.split(",")) if a.crop else auto_crop(sw, sh)
++
++    filters = []
++    if a.delogo:
++        dx, dy, dw, dh = (int(v) for v in a.delogo.split(","))
++        filters.append(f"delogo=x={dx}:y={dy}:w={dw}:h={dh}")
++    if a.layout in ("side", "center"):
++        pw = max(8, min(W - (20 if a.layout == "side" else 0), round(cw * H / ch)))
++    else:
++        pw = W
++    filters += [f"crop={cw}:{ch}:{cx}:{cy}", f"fps={fps}", f"scale={pw * SS}:{H * SS}:flags=lanczos"]
++
++    tmp = tempfile.mkdtemp(prefix="breach_")
++    try:
++        cmd = ["ffmpeg", "-v", "error", "-y"]
++        if a.start:
++            cmd += ["-ss", str(a.start)]
++        if a.end is not None:
++            cmd += ["-t", str(max(0.1, a.end - a.start))]
++        cmd += ["-i", a.input, "-vf", ",".join(filters), os.path.join(tmp, "f_%04d.png")]
++        run(cmd)
++        names = sorted(n for n in os.listdir(tmp) if n.startswith("f_"))
++        if not names:
++            sys.exit("No frames produced - check --start/--end")
++        if len(names) > 70:
++            print(f"warning: {len(names)} frames is a lot of memory for the Flipper, consider a lower --fps or a shorter clip")
++
++        anim = f"{a.name}_{W}x{H}"
++        anims_dir = os.path.join(a.out, "Anims")
++        dest = os.path.join(anims_dir, anim)
++        if os.path.isdir(dest):
++            shutil.rmtree(dest)
++        os.makedirs(dest)
++
++        for i, n in enumerate(names):
++            im = to_1bit(Image.open(os.path.join(tmp, n)), (pw, H), a.threshold, a.mode)
++            if a.layout == "side":
++                full = Image.new("L", (W, H), 255)
++                full.paste(side_panel(W - pw, a.text, i, not a.no_glitch), (0, 0))
++                full.paste(im.convert("L"), (W - pw, 0))
++                im = full.point(lambda p: 255 if p >= 128 else 0).convert("1")
++            elif a.layout == "center":
++                full = Image.new("L", (W, H), 255)
++                full.paste(im.convert("L"), ((W - pw) // 2, 0))
++                im = full.point(lambda p: 255 if p >= 128 else 0).convert("1")
++            if a.invert:
++                im = ImageOps.invert(im.convert("L")).convert("1")
++            im.save(os.path.join(dest, f"frame_{i}.png"))
++
++        count = len(names)
++        with open(os.path.join(dest, "meta.txt"), "w", newline="\n") as f:
++            f.write("Filetype: Flipper Animation\nVersion: 1\n\n")
++            f.write(f"Width: {W}\nHeight: {H}\n")
++            f.write(f"Passive frames: {count}\nActive frames: 0\n")
++            f.write("Frames order: " + " ".join(str(i) for i in range(count)) + "\n")
++            f.write(f"Active cycles: 0\nFrame rate: {fps}\nDuration: 3600\nActive cooldown: 0\n\n")
++            f.write("Bubble slots: 0\n")
++
++        # manifest lists every animation folder of the pack
++        found = sorted(d for d in os.listdir(anims_dir) if os.path.isdir(os.path.join(anims_dir, d)))
++        if not a.keep:
++            for d in found:
++                if d != anim:
++                    shutil.rmtree(os.path.join(anims_dir, d))
++            found = [anim]
++        with open(os.path.join(anims_dir, "manifest.txt"), "w", newline="\n") as f:
++            f.write("Filetype: Flipper Animation Manifest\nVersion: 1\n")
++            for d in found:
++                f.write(f"\nName: {d}\nMin butthurt: 0\nMax butthurt: 18\n"
++                        f"Min level: 1\nMax level: 30\nWeight: 3\n")
++
++        print(f"OK: {count} frames @ {fps} fps -> {dest}")
++        if not a.no_sd:
++            make_sd_copy(a.out, a.sd_out)
++        print("Next steps: see breach/WALLPAPER.md")
++    finally:
++        shutil.rmtree(tmp, ignore_errors=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/lib/momentum/settings.c b/lib/momentum/settings.c
+index c2030aa..e9d3319 100644
+--- a/lib/momentum/settings.c
++++ b/lib/momentum/settings.c
+@@ -7,7 +7,7 @@
+ #define TAG "MomentumSettings"
+ 
+ MomentumSettings momentum_settings = {
+-    .asset_pack = "", // Default
++    .asset_pack = "Breach", // Breach pack (falls back to default if missing)
+     .anim_speed = 100, // 100%
+     .cycle_anims = 0, // Meta.txt
+     .unlock_anims = false, // OFF
